@@ -12,8 +12,6 @@
 [![Redis](https://img.shields.io/badge/Redis-7.0+-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
----
-
 ## What is InitOps?
 
 **InitOps** is a single-file, interactive Python CLI that turns a fresh Ubuntu 24.04 server into a production-ready WordPress host in minutes.
@@ -26,8 +24,6 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 - **Discord Monitoring** — Bilingual server health alerts (EN/VI)
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention
-
----
 
 ## Quick Start
 
@@ -42,8 +38,6 @@ After installation, relaunch anytime with:
 initops
 ```
 
----
-
 ## Requirements
 
 | Requirement | Details |
@@ -52,8 +46,6 @@ initops
 | **Privileges** | Root (`sudo` or `root` user) |
 | **Network** | Internet access for package installation |
 | **RAM** | 1 GB minimum (2 GB+ recommended) |
-
----
 
 ## Features
 
@@ -106,8 +98,6 @@ Change your domain without breaking anything:
 - Auto-gzip compression
 - Auto-cleanup: deletes backups older than 30 days
 
----
-
 ## Interactive Menu
 
 ```
@@ -128,8 +118,6 @@ Change your domain without breaking anything:
 Option (0-6):
 ```
 
----
-
 ## Configuration Files
 
 | Component | Path |
@@ -144,8 +132,6 @@ Option (0-6):
 | Monitor Config | `/etc/.initops_pulse.conf` |
 | Monitor Script | `/usr/local/bin/init-server-pulse.sh` |
 
----
-
 ## Post-Deployment Checklist
 
 1. **Point your domain** to the server's public IP
@@ -157,33 +143,23 @@ Option (0-6):
 3. **Secure your credentials** — the DB password is shown once during deployment
 4. **Install a caching plugin** (e.g., W3 Total Cache or LiteSpeed Cache) and point it to Redis
 
----
-
 ## License
 
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
 
 > **Why MIT?** It's permissive, widely recognized, and lets anyone use InitOps for personal or commercial projects. The only requirement is keeping the copyright notice — which helps build trust and attribution.
 
----
-
 ## Support & Feedback
 
 > If you encounter any issues or have feature requests, please open an [Issue](https://github.com/brokensmile2103/initops/issues).
-
----
 
 ## Contributing
 
 > Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
 
----
-
 ## Disclaimer
 
 > **Use at your own risk.** InitOps modifies system-level configurations (nginx, mysql, redis, iptables, cron). Always back up your server or test on a non-production VM first. The authors are not responsible for data loss or service interruption.
-
----
 
 ## Acknowledgments
 
