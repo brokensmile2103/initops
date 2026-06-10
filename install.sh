@@ -15,7 +15,7 @@ apt-get update -y > /dev/null 2>&1
 apt-get install -y python3 curl > /dev/null 2>&1
 
 echo -e "\e[1;32m[*] Fetching InitOps setup engine...\e[0m"
-curl -fsSL -H "Cache-Control: no-cache" "https://inithtml.com/initops/setup.py?v=$(date +%s)" -o /usr/local/bin/initops
+curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/brokensmile2103/initops/main/setup.py" -o /usr/local/bin/initops
 
 if [ ! -f /usr/local/bin/initops ]; then
   echo -e "\e[1;31m[ERROR]\e[0m Failed to download setup engine. Verify network connection."
