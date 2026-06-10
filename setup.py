@@ -9,8 +9,9 @@ import json
 import urllib.request
 import urllib.error
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
+WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
 PULSE_SCRIPT_PATH    = "/usr/local/bin/init-server-pulse.sh"
 PULSE_CRON_D_PATH    = "/etc/cron.d/initops-server-pulse"
@@ -607,6 +608,7 @@ def deploy_wordpress(domain, db_name, db_user, db_prefix):
         "\n/* Redis Object Cache — Unix Socket */\n"
         "define( 'WP_REDIS_SCHEME', 'unix' );\n"
         "define( 'WP_REDIS_PATH', '/var/run/redis/redis.sock' );\n"
+        "define( 'WP_REDIS_DATABASE', 0 );\n"
         "define( 'WP_REDIS_TIMEOUT', 1 );\n"
         "define( 'WP_REDIS_READ_TIMEOUT', 1 );\n"
         f"define( 'WP_REDIS_PREFIX', '{redis_prefix}' );\n"
@@ -732,7 +734,16 @@ def print_help_menu():
     print(" MariaDB Tuning:    /etc/mysql/conf.d/z_custom_optimize.cnf")
     print(" Redis Config:      /etc/redis/redis.conf")
     print(" WP Config:         /var/www/html/wp-config.php")
+    print(" Fail2Ban Config:   /etc/fail2ban/jail.local")
     print(" System Cron:       crontab -u www-data -l")
+    print("-" * 60)
+    print(" \033[1;36m--- Server Monitor (Pulse) ---\033[0m")
+    print(f" Pulse Config:      {PULSE_CONFIG_FILE}")
+    print(f" Pulse Script:      {PULSE_SCRIPT_PATH}")
+    print(f" Pulse Cron:        {PULSE_CRON_D_PATH}")
+    print("-" * 60)
+    print(" \033[1;36m--- Backups ---\033[0m")
+    print(" DB Backup Dir:     /var/backups/wordpress/")
     print("-" * 60)
     print(" \033[1;33mTo install SSL Certificate (HTTPS):\033[0m")
     print(" 1. Ensure your domain points to this server's IP address.")
@@ -903,82 +914,166 @@ def change_domain():
     print("\nPress Enter to return to the main menu...")
     input()
 
+def _get_websites_list():
+    """Scan all WordPress installations on the server."""
+    sites = []
+
+    # --- Root site (deploy_wordpress) at /var/www/html ---
+    if os.path.exists('/var/www/html/wp-config.php'):
+        domain = "html"
+        try:
+            res = subprocess.run(
+                "wp option get home --path=/var/www/html --allow-root",
+                shell=True, capture_output=True, text=True
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                url = res.stdout.strip()
+                domain = re.sub(r'https?://(www\.)?', '', url).replace('/', '_').strip()
+        except Exception:
+            pass
+        sites.append({'domain': domain, 'path': '/var/www/html', 'slug': 'html'})
+
+    # --- Additional sites from WEBSITES_CONFIG_FILE ---
+    if os.path.exists(WEBSITES_CONFIG_FILE):
+        try:
+            with open(WEBSITES_CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    domain_m = re.search(r'domain=([^ ]+)', line)
+                    path_m   = re.search(r'path=([^ ]+)', line)
+                    if path_m:
+                        path = path_m.group(1)
+                        domain = domain_m.group(1) if domain_m else "site"
+                        slug = os.path.basename(path)
+                        # Only add if actually exists
+                        if os.path.exists(os.path.join(path, 'wp-config.php')):
+                            sites.append({'domain': domain, 'path': path, 'slug': slug})
+        except Exception:
+            pass
+
+    return sites
+
+def _backup_single_site(wp_path, site_slug, backup_dir):
+    """Backup a single site. Returns (success_bool, result_msg)."""
+    if not os.path.exists(os.path.join(wp_path, 'wp-config.php')):
+        return False, f"WordPress not found at {wp_path}"
+
+    os.makedirs(backup_dir, exist_ok=True)
+
+    # Get domain for backup filename
+    domain = site_slug
+    res_home = subprocess.run(
+        f"wp option get home --path={wp_path} --allow-root",
+        shell=True, capture_output=True, text=True
+    )
+    if res_home.returncode == 0 and res_home.stdout.strip():
+        url = res_home.stdout.strip()
+        domain = re.sub(r'https?://(www\.)?', '', url).replace('/', '_').strip()
+
+    if not domain or domain == "_":
+        domain = site_slug
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    sql_filename = f"wp_db_{domain}_{timestamp}.sql"
+    sql_path = os.path.join(backup_dir, sql_filename)
+    gz_path = f"{sql_path}.gz"
+
+    # Export DB
+    export_cmd = subprocess.run(
+        f"wp db export {sql_path} --path={wp_path} --allow-root",
+        shell=True, capture_output=True, text=True
+    )
+    if export_cmd.returncode != 0:
+        return False, f"Export failed: {export_cmd.stderr.strip()}"
+
+    # Compress
+    compress_cmd = subprocess.run(f"gzip -f {sql_path}", shell=True)
+    if compress_cmd.returncode != 0:
+        return False, "Compression failed"
+
+    return True, gz_path
+
 def backup_database():
-    """Backs up the WordPress database using WP-CLI, compresses it with gzip, and applies a 30-day retention policy."""
+    """Backs up WordPress database — single site or all sites."""
     backup_dir = '/var/backups/wordpress'
-    wp_path = '/var/www/html'
 
     os.system('clear')
     print("\033[1;36m" + "=" * 60)
     print("              WordPress Database Backup                      ")
     print("=" * 60 + "\033[0m")
 
-    # Ensure the backup directory exists
-    os.makedirs(backup_dir, exist_ok=True)
+    sites = _get_websites_list()
 
-    # Check if WordPress is actually deployed here
-    if not os.path.exists(os.path.join(wp_path, 'wp-config.php')):
-        print("\033[1;31m[ERROR]\033[0m WordPress installation not found at /var/www/html")
-        print("Please deploy WordPress first before taking backups.")
+    if not sites:
+        print("\033[1;31m[ERROR]\033[0m No WordPress installations found.")
         print("\nPress Enter to return to the main menu...")
         input()
         return
 
-    print("\033[1;34m[*] Fetching site URL for descriptive backup naming...\033[0m")
-    res_home = subprocess.run(
-        f"wp option get home --path={wp_path} --allow-root", 
-        shell=True, capture_output=True, text=True
-    )
-    
-    # Extract domain name safely to use in the filename
-    domain = "site"
-    if res_home.returncode == 0 and res_home.stdout.strip():
-        url = res_home.stdout.strip()
-        domain = re.sub(r'https?://(www\.)?', '', url).replace('/', '_').strip()
+    print(f"\033[1;34m[*] Found {len(sites)} website(s) on this server:\033[0m")
+    for i, site in enumerate(sites, 1):
+        display_domain = site['domain'] if site['domain'] != "_" else "Direct IP"
+        print(f" [{i}] {display_domain:20s}  ({site['path']})")
+    print("-" * 60)
+    print(" [1] Backup ALL websites")
+    print(" [2] Backup specific website")
+    print(" [0] Return to main menu")
+    print("-" * 60)
 
-    # Generate filename with timestamp (YYYYMMDD_HHMMSS)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sql_filename = f"wp_db_{domain}_{timestamp}.sql"
-    sql_path = os.path.join(backup_dir, sql_filename)
-    gz_path = f"{sql_path}.gz"
+    choice = input("Select option: ").strip()
 
-    print(f"\n\033[1;32m[*] Exporting database via WP-CLI...\033[0m")
-    print(f" -> Temporary file: {sql_path}")
-    
-    # Exporting DB without requiring any passwords
-    export_cmd = subprocess.run(
-        f"wp db export {sql_path} --path={wp_path} --allow-root",
-        shell=True, capture_output=True, text=True
-    )
-
-    if export_cmd.returncode != 0:
-        print("\033[1;31m[ERROR]\033[0m Failed to export database via WP-CLI.")
-        print(export_cmd.stderr)
-        print("\nPress Enter to return to the main menu...")
-        input()
+    if choice == "0":
         return
 
-    print("\033[1;32m -> Database exported successfully.\033[0m")
-    print("\033[1;34m[*] Compressing backup file with gzip (Auto-removes raw .sql)...\033[0m")
-
-    # gzip automatically compresses and deletes the source .sql file
-    compress_cmd = subprocess.run(f"gzip -f {sql_path}", shell=True)
-
-    if compress_cmd.returncode == 0:
-        print(f"\033[1;32m -> Compression complete. Raw .sql file cleared.\033[0m")
-        print(f" -> Backup successfully stored at: \033[1;36m{gz_path}\033[0m")
-
-        # Smart Feature: Delete backups older than 30 days to prevent full disk crashes
-        print("\n\033[1;34m[*] Running retention check (cleaning backups older than 30 days)...\033[0m")
-        subprocess.run(f"find {backup_dir} -name 'wp_db_*.sql.gz' -mtime +30 -delete", shell=True)
-        print("\033[1;32m -> Retention policy applied cleanly.\033[0m")
-
-        print(f"\n\033[1;32m{'=' * 60}")
-        print(" Database backup process completed successfully!")
-        print(f"{'=' * 60}\033[0m")
+    targets = []
+    if choice == "1":
+        targets = sites
+    elif choice == "2":
+        idx = input("Enter website number to backup: ").strip()
+        try:
+            n = int(idx)
+            if 1 <= n <= len(sites):
+                targets = [sites[n - 1]]
+            else:
+                print("\033[1;31m[ERROR]\033[0m Invalid selection.")
+                input("\nPress Enter...")
+                return
+        except ValueError:
+            print("\033[1;31m[ERROR]\033[0m Invalid input.")
+            input("\nPress Enter...")
+            return
     else:
-        print("\033[1;31m[ERROR]\033[0m Failed to compress the backup file.")
+        print("\033[1;31m[ERROR]\033[0m Invalid option.")
+        input("\nPress Enter...")
+        return
 
+    print(f"\n\033[1;32m[*] Starting backup ({len(targets)} site(s))...\033[0m")
+    success_count = 0
+
+    for i, site in enumerate(targets, 1):
+        display_name = site['domain'] if site['domain'] != "_" else "Direct IP"
+        print(f"\n -> [{i}/{len(targets)}] Backing up \033[1;36m{display_name}\033[0m ...")
+        ok, msg = _backup_single_site(site['path'], site['slug'], backup_dir)
+        if ok:
+            print(f"    \033[1;32mOK\033[0m -> {msg}")
+            success_count += 1
+        else:
+            print(f"    \033[1;31mFAILED\033[0m -> {msg}")
+
+    # Cleanup backups older than 30 days
+    print("\n\033[1;34m[*] Running retention check (cleaning backups older than 30 days)...\033[0m")
+    subprocess.run(
+        f"find {backup_dir} -name 'wp_db_*.sql.gz' -mtime +30 -delete",
+        shell=True
+    )
+    print("\033[1;32m -> Retention policy applied.\033[0m")
+
+    print(f"\n\033[1;32m{'=' * 60}")
+    print(f" Backup complete: {success_count}/{len(targets)} site(s) succeeded.")
+    print(f" Backup directory: {backup_dir}")
+    print(f"{'=' * 60}\033[0m")
     print("\nPress Enter to return to the main menu...")
     input()
 
@@ -1042,25 +1137,25 @@ _PULSE_STRINGS = {
     },
     "vi": {
         # Setup UI
-        "header":            "Server Monitor — Cấu hình Discord Webhook",
+        "header":            "Server Monitor — Discord Webhook Setup",
         "label_profile":     "Profile",
-        "label_cron":        "Cron interval (tự động chọn)",
-        "label_monitors":    "Theo dõi",
-        "found_existing":    "Đã tìm thấy cấu hình cũ",
-        "keep_or_override":  "Nhấn Enter để giữ nguyên, hoặc nhập URL mới để ghi đè.",
-        "prompt_webhook_new":"Discord Webhook URL (bắt buộc): ",
-        "prompt_webhook_old":"Discord Webhook URL [Enter = giữ nguyên]: ",
-        "err_webhook":       "URL không hợp lệ. Định dạng đúng: https://discord.com/api/webhooks/<id>/<token>",
-        "testing_webhook":   "Đang kiểm tra kết nối webhook...",
-        "err_test_failed":   "Không gửi được tin nhắn test. Kiểm tra lại URL hoặc quyền webhook trong Discord.",
-        "webhook_ok":        "Webhook hoạt động! Tin nhắn test đã được gửi thành công.",
-        "summary_header":    "Server Monitor đã cài đặt thành công!",
+        "label_cron":        "Cron interval (auto-selected)",
+        "label_monitors":    "Monitors",
+        "found_existing":    "Existing config found",
+        "keep_or_override":  "Press Enter to keep it, or paste a new URL to override.",
+        "prompt_webhook_new":"Discord Webhook URL (required): ",
+        "prompt_webhook_old":"Discord Webhook URL [Enter = keep current]: ",
+        "err_webhook":       "Invalid URL. Expected: https://discord.com/api/webhooks/<id>/<token>",
+        "testing_webhook":   "Testing webhook connection...",
+        "err_test_failed":   "Could not reach the webhook. Check the URL and Discord channel permissions.",
+        "webhook_ok":        "Webhook is live! Test message delivered successfully.",
+        "summary_header":    "Server Monitor installed successfully!",
         "summary_config":    "Config",
         "summary_script":    "Pulse script",
         "summary_cron":      "Cron file",
         "summary_schedule":  "Schedule",
-        "tip_uninstall":     "Để gỡ cài đặt monitor, xóa file:",
-        "press_enter":       "\nNhấn Enter để quay lại menu chính...",
+        "tip_uninstall":     "To uninstall the monitor, delete:",
+        "press_enter":       "\nPress Enter to return to the main menu...",
         # Discord embed — install test
         "test_title":        "✅ InitOps — Kết nối thành công",
         "test_desc": (
@@ -1209,7 +1304,7 @@ send_discord() {
     local COLOR="${3:-15418949}"
     local TS FOOTER
     TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    FOOTER=$(t embed_footer "version=${VERSION:-1.4.0}")
+    FOOTER=$(t embed_footer "version=${VERSION:-1.5.0}")
 
     curl -s -o /dev/null \
         -H "Content-Type: application/json" \
@@ -1357,15 +1452,15 @@ def setup_server_monitor():
     """
     cpu_cores, ram_mb, profile, profile_txt = get_system_resources()
 
-    # Larger servers poll less frequently — they have more headroom and
-    # their metrics change more slowly than a micro VPS under load.
+    # Larger servers handle heavier traffic, so crashes happen faster and more
+    # often — they need tighter monitoring, not looser.
     CRON_MAP = {
-        "micro":    "*/5 * * * *",
-        "small":    "*/5 * * * *",
+        "micro":    "*/10 * * * *",
+        "small":    "*/10 * * * *",
         "standard": "*/10 * * * *",
-        "medium":   "*/15 * * * *",
-        "large":    "*/20 * * * *",
-        "xlarge":   "*/30 * * * *",
+        "medium":   "*/5 * * * *",
+        "large":    "*/5 * * * *",
+        "xlarge":   "*/5 * * * *",
     }
     cron_schedule = CRON_MAP.get(profile, "*/10 * * * *")
 
@@ -1513,6 +1608,284 @@ def setup_server_monitor():
     print(t("press_enter"))
     input()
 
+def _get_next_redis_db():
+    """Returns the next available Redis database index for a NEW website.
+    DB 0 is RESERVED for the first site (deploy_wordpress).
+    Additional sites start from DB 1 and auto-increment.
+    Reads WEBSITES_CONFIG_FILE to find the highest index in use."""
+    if not os.path.exists(WEBSITES_CONFIG_FILE):
+        return 1
+    used = set()
+    try:
+        with open(WEBSITES_CONFIG_FILE, 'r') as f:
+            for line in f:
+                m = re.search(r'redis_db=(\d+)', line)
+                if m:
+                    used.add(int(m.group(1)))
+    except Exception:
+        pass
+    db = 1
+    while db in used:
+        db += 1
+    return db
+
+def add_website():
+    """[7] Add a new WordPress website to the same server.
+    - Provisions a new DB, WP-CLI install, Nginx vhost, and Redis DB index.
+    - Web root: user-defined or auto-derived from domain
+    - WP_REDIS_DATABASE starts from 1 (DB 0 reserved for first site), auto-incremented.
+    - Does NOT touch the existing /var/www/html installation.
+    """
+    os.system('clear')
+    print("\033[1;36m" + "=" * 60)
+    print("                 Add New Website                              ")
+    print("=" * 60 + "\033[0m")
+
+    print("\033[1;34m--- New Website Configuration ---\033[0m")
+    domain    = validate_domain("-> Domain name (e.g. site2.com) [Default: _]: ")
+    db_name   = validate_input("-> Database name   [Default: wp_site2]: ", "wp_site2")
+    db_user   = f"wp_user_{secrets.randbelow(8999) + 1000}"
+    db_prefix = validate_input("-> Table prefix    [Default: wp_]:        ", "wp_", r'^[a-zA-Z0-9_]+$')
+
+    # -------------------------------------------------------------------------
+    # Custom web root input
+    # -------------------------------------------------------------------------
+    # Auto-suggest a slug from domain for convenience
+    if domain and domain != "_":
+        auto_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', domain)
+    else:
+        auto_slug = db_name
+
+    print(f"\n\033[1;34m--- Web Root Directory ---\033[0m")
+    print(f" -> Auto-suggested: /var/www/\033[1;33m{auto_slug}\033[0m")
+    print("    (Press Enter to accept, or type your own folder name)")
+    
+    while True:
+        raw_folder = input(f"-> Folder name [Default: {auto_slug}]: ").strip()
+        if not raw_folder:
+            site_slug = auto_slug
+            break
+        # Validate: no slashes, no spaces, alphanumeric + underscore + hyphen + dot only
+        if re.match(r'^[a-zA-Z0-9_.-]+$', raw_folder):
+            site_slug = raw_folder
+            break
+        print("\033[1;31m[Error]\033[0m Invalid folder name. Use letters, numbers, underscores, hyphens, or dots only. No slashes or spaces.")
+
+    wp_path = f"/var/www/{site_slug}"
+
+    # Safety: refuse to clobber an existing installation
+    if os.path.exists(os.path.join(wp_path, 'wp-config.php')):
+        print(f"\033[1;31m[ERROR]\033[0m A WordPress installation already exists at {wp_path}.")
+        print("Aborting to prevent data loss. Choose a different folder name.")
+        print("\nPress Enter to return to the main menu...")
+        input()
+        return
+
+    print(f"\n\033[1;34m[*] Web root will be: {wp_path}\033[0m")
+    confirm = input("Type 'yes' to proceed or press Enter to cancel: ").strip().lower()
+    if confirm != "yes":
+        print("Cancelled. No changes made.")
+        print("\nPress Enter to return to the main menu...")
+        input()
+        return
+
+    print(f"\n\033[1;32m[*] Deploying WordPress to {wp_path}...\033[0m")
+
+    os.makedirs(wp_path, exist_ok=True)
+
+    # -------------------------------------------------------------------------
+    # Database
+    # -------------------------------------------------------------------------
+    db_pass = secrets.token_urlsafe(20)
+
+    run_cmd(f"mysql -u root -e \"CREATE DATABASE IF NOT EXISTS \\`{db_name}\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"")
+    run_cmd(f"mysql -u root -e \"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_pass}';\"")
+    run_cmd(f"mysql -u root -e \"GRANT ALL PRIVILEGES ON \\`{db_name}\\`.* TO '{db_user}'@'localhost';\"")
+    run_cmd("mysql -u root -e \"FLUSH PRIVILEGES;\"")
+    print("\033[1;32m -> Database created.\033[0m")
+
+    # -------------------------------------------------------------------------
+    # WordPress core download & wp-config
+    # -------------------------------------------------------------------------
+    run_cmd(f"wp core download --path={wp_path} --allow-root")
+
+    run_cmd(
+        f"wp config create "
+        f"--dbname={db_name} --dbuser={db_user} --dbpass={db_pass} "
+        f"--dbprefix={db_prefix} "
+        f"--dbhost=\":/run/mysqld/mysqld.sock\" "
+        f"--dbcharset=utf8mb4 "
+        f"--dbcollate=utf8mb4_unicode_ci "
+        f"--path={wp_path} --allow-root"
+    )
+
+    # -------------------------------------------------------------------------
+    # Redis config — auto-assign next available DB index (starts from 1)
+    # -------------------------------------------------------------------------
+    redis_db    = _get_next_redis_db()
+    redis_prefix = f"io_{secrets.token_hex(4)}:"
+
+    redis_wp_inject = (
+        "\n/* Redis Object Cache — Unix Socket */\n"
+        "define( 'WP_REDIS_SCHEME', 'unix' );\n"
+        "define( 'WP_REDIS_PATH', '/var/run/redis/redis.sock' );\n"
+        f"define( 'WP_REDIS_DATABASE', {redis_db} );\n"
+        "define( 'WP_REDIS_TIMEOUT', 1 );\n"
+        "define( 'WP_REDIS_READ_TIMEOUT', 1 );\n"
+        f"define( 'WP_REDIS_PREFIX', '{redis_prefix}' );\n"
+        "\n/* WordPress Performance */\n"
+        "define( 'WP_POST_REVISIONS', 5 );\n"
+        "define( 'AUTOSAVE_INTERVAL', 120 );\n"
+        "define( 'EMPTY_TRASH_DAYS', 7 );\n"
+        "define( 'DISALLOW_FILE_EDIT', true );\n"
+        "define( 'DISABLE_WP_CRON', true );\n"
+    )
+
+    stop_marker    = "/* That's all, stop editing!"
+    wp_config_path = f"{wp_path}/wp-config.php"
+    try:
+        with open(wp_config_path, 'r') as f:
+            content = f.read()
+        if stop_marker in content:
+            content = content.replace(stop_marker, redis_wp_inject + stop_marker)
+        else:
+            content += redis_wp_inject
+        with open(wp_config_path, 'w') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"\033[1;31m[ERROR]\033[0m Failed to patch wp-config.php: {e}")
+        print("\nPress Enter to return to the main menu...")
+        input()
+        return
+
+    # -------------------------------------------------------------------------
+    # Nginx vhost
+    # -------------------------------------------------------------------------
+    run_cmd(f"touch {wp_path}/nginx.conf")
+
+    server_name = domain if domain != '_' else '_'
+    nginx_vhost = f"""server {{
+    listen 80;
+    listen [::]:80;
+    server_name {server_name};
+    root {wp_path};
+    index index.php index.html index.htm;
+    client_max_body_size 128m;
+
+    location / {{
+        limit_conn conn_limit_per_ip 10;
+        limit_req zone=req_limit_per_ip burst=20 nodelay;
+        try_files $uri $uri/ /index.php?$args;
+    }}
+
+    location ~ \\.php$ {{
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
+    }}
+
+    location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|otf|eot)$ {{
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        log_not_found off;
+        access_log off;
+    }}
+
+    location ~ /\\.(?:ht|git|svn) {{ deny all; }}
+    location ~* wp-config\\.php {{ deny all; }}
+    location ~* /(?:uploads|files)/.*\\.php$ {{ deny all; }}
+    location = /xmlrpc.php {{ deny all; }}
+
+    include {wp_path}/nginx.conf;
+}}"""
+
+    vhost_file = f"/etc/nginx/sites-available/{site_slug}"
+    with open(vhost_file, 'w') as f:
+        f.write(nginx_vhost)
+
+    vhost_link = f"/etc/nginx/sites-enabled/{site_slug}"
+    if not os.path.exists(vhost_link):
+        os.symlink(vhost_file, vhost_link)
+
+    # Validate before reload
+    nginx_check = subprocess.run(
+        "nginx -t", shell=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    if nginx_check.returncode != 0:
+        print("\033[1;31m[CONFIG ERROR]\033[0m Nginx validation failed:")
+        print(nginx_check.stderr.decode())
+        print("Reverting vhost...")
+        os.remove(vhost_file)
+        if os.path.exists(vhost_link):
+            os.remove(vhost_link)
+        print("\nPress Enter to return to the main menu...")
+        input()
+        return
+
+    run_cmd("systemctl reload nginx")
+
+    # -------------------------------------------------------------------------
+    # Permissions
+    # -------------------------------------------------------------------------
+    run_cmd(f"chown -R www-data:www-data {wp_path}")
+    run_cmd(f"find {wp_path} -type d -exec chmod 755 {{}} \\;")
+    run_cmd(f"find {wp_path} -type f -exec chmod 644 {{}} \\;")
+    run_cmd(f"chmod 640 {wp_path}/wp-config.php")
+
+    # -------------------------------------------------------------------------
+    # WP-Cron for new site
+    # -------------------------------------------------------------------------
+    cron_job    = f"* * * * * flock -n /tmp/wp-cron-{site_slug}.lock wp cron event run --due-now --path={wp_path} --quiet > /dev/null 2>&1\n"
+    cron_marker = f"# wp-cron {site_slug} managed by InitOps"
+
+    result = subprocess.run(
+        "crontab -u www-data -l",
+        shell=True, capture_output=True, text=True
+    )
+    existing = result.stdout if result.returncode == 0 else ""
+
+    if wp_path not in existing:
+        new_crontab = existing.rstrip("\n") + f"\n{cron_marker}\n{cron_job}"
+        subprocess.run(
+            "crontab -u www-data -",
+            shell=True, input=new_crontab, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+
+    # -------------------------------------------------------------------------
+    # Record site in WEBSITES_CONFIG_FILE
+    # -------------------------------------------------------------------------
+    record = f"domain={domain} path={wp_path} db={db_name} db_user={db_user} redis_db={redis_db}\n"
+    with open(WEBSITES_CONFIG_FILE, 'a') as f:
+        f.write(record)
+    os.chmod(WEBSITES_CONFIG_FILE, 0o600)
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    print("\n\033[1;32m" + "=" * 60)
+    print("          New website deployed successfully!                  ")
+    print("=" * 60 + "\033[0m")
+    print(f" -> Web root:          {wp_path}")
+    print(f" -> Domain:            {domain if domain != '_' else 'Direct Public IP'}")
+    print(f" -> Database:          {db_name}")
+    print(f" -> Database user:     {db_user}")
+    print(f" -> Database password: {db_pass}")
+    print(f" -> Table prefix:      {db_prefix}")
+    print(f" -> Redis DB index:    {redis_db}")
+    print(f" -> Nginx vhost:       {vhost_file}")
+    print("=" * 60)
+    print("\033[1;33m[!] Save these credentials securely. They will not be shown again.\033[0m")
+    if domain != "_":
+        print(f"\n\033[1;36m[TIP] To enable HTTPS, ensure DNS points here then run:\033[0m")
+        print(f"      certbot --nginx -d {domain}")
+    print("\nOpen your domain/IP in a browser to complete the WordPress setup.\n")
+    print("Press Enter to return to the main menu...")
+    input()
+
 def main():
     check_os()
     sys.stdin = open('/dev/tty', 'r')
@@ -1543,10 +1916,14 @@ def main():
 
         print(" [5] Backup WordPress Database")
         print(" [6] Server Monitor (Discord Webhook)")
+        if is_deployed:
+            print(" [7] Add New Website")
+        else:
+            print(" \033[1;30m[7] Add New Website (Deploy first)\033[0m")
         print(" [0] Exit")
         print("-" * 60)
 
-        choice = input("Option (0-6): ").strip()
+        choice = input("Option (0-7): ").strip()
 
         if choice == "1":
             if is_deployed:
@@ -1629,6 +2006,14 @@ def main():
 
         elif choice == "6":
             setup_server_monitor()
+
+        elif choice == "7":
+            if not is_deployed:
+                print("\n\033[1;33m[WARNING]\033[0m Base stack not deployed yet. Please run Option 1 first.")
+                print("Press Enter to continue...")
+                input()
+                continue
+            add_website()
 
         elif choice == "0":
             print("Exiting.")
