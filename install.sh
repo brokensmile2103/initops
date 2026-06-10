@@ -1,6 +1,6 @@
 #!/bin/bash
 # -------------------------------------------------------------------------
-# InitOps v1.4.0 - Automated LEMP & WordPress Deployment Engine
+# InitOps v1.5.0 - Automated LEMP & WordPress Deployment Engine
 # -------------------------------------------------------------------------
 
 if [ "$EUID" -ne 0 ]; then
