@@ -26,6 +26,12 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention
 
 ## Quick Start
+```bash
+# Run as root on a fresh Ubuntu 24.04 LTS server
+curl -fsSL https://raw.githubusercontent.com/brokensmile2103/initops/main/install.sh | sudo bash
+```
+
+Or:
 
 ```bash
 # Run as root on a fresh Ubuntu 24.04 LTS server
