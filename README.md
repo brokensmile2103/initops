@@ -1,8 +1,7 @@
-
-# InitOps v1.4.0
+# InitOps v1.5.0
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
-> 
+>
 > Optimized for real-world VPS tiers — from 1 GB micro instances to 32 GB+ dedicated servers.
 
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
@@ -21,11 +20,13 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 - **LEMP Stack** — Nginx, MariaDB, PHP 8.3-FPM, Redis
 - **Security Hardening** — iptables firewall, Fail2Ban, socket-only DB/Redis
 - **Auto-Tuned Performance** — 6 hardware profiles (micro → xlarge)
+- **Multi-Site Support** — Deploy multiple WordPress sites on the same VPS
 - **Discord Monitoring** — Bilingual server health alerts (EN/VI)
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
-- **Smart Backups** — WP-CLI exports with gzip + 30-day retention
+- **Smart Backups** — WP-CLI exports with gzip + 30-day retention (single or all sites)
 
 ## Quick Start
+
 ```bash
 # Run as root on a fresh Ubuntu 24.04 LTS server
 curl -fsSL https://raw.githubusercontent.com/brokensmile2103/initops/main/install.sh | sudo bash
@@ -34,7 +35,6 @@ curl -fsSL https://raw.githubusercontent.com/brokensmile2103/initops/main/instal
 Or:
 
 ```bash
-# Run as root on a fresh Ubuntu 24.04 LTS server
 curl -fsSL https://inithtml.com/initops/install.sh | sudo bash
 ```
 
@@ -73,13 +73,22 @@ Each profile tunes:
 - MariaDB `innodb_buffer_pool_size` (up to 45% of RAM)
 - Redis `maxmemory` & eviction policies
 
-### 2. Security by Default
+### 2. Multi-Site on One VPS
+Deploy multiple independent WordPress sites on the same server:
+
+- Each site gets its own **database**, **Redis DB index**, and **Nginx vhost**
+- Custom web root folder names (`/var/www/<your-folder>`)
+- Isolated Redis databases (DB 0 for the first site, DB 1+ for additional sites)
+- Per-site WP-Cron via `flock` to prevent overlapping processes
+- Backup supports **all sites at once** or **individual selection**
+
+### 3. Security by Default
 - **iptables** — Ports 22, 80, 443 only
 - **Fail2Ban** — SSH brute-force protection (5 retries / 1h ban)
 - **Socket Mode** — MariaDB & Redis communicate via Unix sockets (no TCP exposure)
 - **WP Hardening** — `DISALLOW_FILE_EDIT`, disabled XML-RPC, cron offloaded to system
 
-### 3. Discord Server Monitor
+### 4. Discord Server Monitor
 Bilingual (English / Vietnamese) webhook alerting for:
 - Disk space critical
 - RAM exhaustion
@@ -87,28 +96,29 @@ Bilingual (English / Vietnamese) webhook alerting for:
 - MySQL/MariaDB downtime
 - Auto-recovery notifications
 
-Profile-aware cron intervals (every 5–30 minutes).
+Profile-aware cron intervals (every 5–10 minutes).
 
-### 4. One-Shot Domain Migration
+### 5. One-Shot Domain Migration
 Change your domain without breaking anything:
 - Updates Nginx vhost
 - Issues new SSL via Certbot
 - Performs precise DB search-replace (respects serialized data)
 - Flushes Redis cache automatically
 
-### 5. Database Backups
+### 6. Database Backups
 ```
 /var/backups/wordpress/wp_db_<domain>_<YYYYMMDD_HHMMSS>.sql.gz
 ```
 - WP-CLI export (no password prompts)
 - Auto-gzip compression
 - Auto-cleanup: deletes backups older than 30 days
+- **Multi-site aware** — backup all sites or select individual ones
 
 ## Interactive Menu
 
 ```
 ============================================================
-                    InitOps v1.4.0
+                    InitOps v1.5.0
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
  [Optimization Profile]: Standard (3.5 – 6 GB | e.g. 4 GB VPS)
@@ -119,9 +129,10 @@ Change your domain without breaking anything:
  [4] Change Domain & Renew SSL
  [5] Backup WordPress Database
  [6] Server Monitor (Discord Webhook)
+ [7] Add New Website
  [0] Exit
 ------------------------------------------------------------
-Option (0-6):
+Option (0-7):
 ```
 
 ## Configuration Files
@@ -129,12 +140,13 @@ Option (0-6):
 | Component | Path |
 |-----------|------|
 | Nginx Main | `/etc/nginx/nginx.conf` |
-| Nginx Vhost | `/etc/nginx/sites-available/wordpress` |
+| Nginx Vhost (default) | `/etc/nginx/sites-available/wordpress` |
 | PHP-FPM Pool | `/etc/php/8.3/fpm/pool.d/z_custom_pm.conf` |
 | PHP Tuning | `/etc/php/8.3/fpm/conf.d/99-initops-runtime.ini` |
 | MariaDB Tuning | `/etc/mysql/conf.d/z_custom_optimize.cnf` |
 | Redis Config | `/etc/redis/redis.conf` |
-| WP Config | `/var/www/html/wp-config.php` |
+| WP Config (default) | `/var/www/html/wp-config.php` |
+| Sites Registry | `/etc/.initops_websites.conf` |
 | Monitor Config | `/etc/.initops_pulse.conf` |
 | Monitor Script | `/usr/local/bin/init-server-pulse.sh` |
 
@@ -148,6 +160,21 @@ Option (0-6):
    *(Or use Option [4] in the InitOps menu for full migration)*
 3. **Secure your credentials** — the DB password is shown once during deployment
 4. **Install a caching plugin** (e.g., W3 Total Cache or LiteSpeed Cache) and point it to Redis
+
+## Adding More Sites
+
+Use **Option [7]** in the InitOps menu to deploy additional WordPress sites:
+
+```bash
+initops
+# Select [7] Add New Website
+```
+
+Each new site gets:
+- Independent database with auto-generated credentials
+- Dedicated Redis DB index (auto-incremented from DB 1)
+- Custom web root folder under `/var/www/`
+- Isolated Nginx vhost and System Cron
 
 ## License
 
