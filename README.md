@@ -29,13 +29,13 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 
 ```bash
 # Run as root on a fresh Ubuntu 24.04 LTS server
-curl -fsSL https://raw.githubusercontent.com/brokensmile2103/initops/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/brokensmile2103/initops/main/install.sh | bash
 ```
 
 Or:
 
 ```bash
-curl -fsSL https://inithtml.com/initops/install.sh | sudo bash
+curl -fsSL https://inithtml.com/initops/install.sh | bash
 ```
 
 After installation, relaunch anytime with:
