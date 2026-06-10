@@ -151,15 +151,15 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ## Support & Feedback
 
-> If you encounter any issues or have feature requests, please open an [Issue](https://github.com/brokensmile2103/initops/issues).
+If you encounter any issues or have feature requests, please open an [Issue](https://github.com/brokensmile2103/initops/issues).
 
 ## Contributing
 
-> Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
+Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
 
 ## Disclaimer
 
-> **Use at your own risk.** InitOps modifies system-level configurations (nginx, mysql, redis, iptables, cron). Always back up your server or test on a non-production VM first. The authors are not responsible for data loss or service interruption.
+**Use at your own risk.** InitOps modifies system-level configurations (nginx, mysql, redis, iptables, cron). Always back up your server or test on a non-production VM first. The authors are not responsible for data loss or service interruption.
 
 ## Acknowledgments
 
