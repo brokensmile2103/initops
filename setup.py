@@ -9,7 +9,7 @@ import json
 import urllib.request
 import urllib.error
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -1886,6 +1886,296 @@ def add_website():
     print("Press Enter to return to the main menu...")
     input()
 
+def setup_cloudflare_ssl():
+    """
+    Configures Certbot to use DNS-01 challenge via Cloudflare for automatic
+    SSL renewal — no HTTP challenge, no open port 80 required.
+
+    What this does:
+      1. Installs python3-certbot-dns-cloudflare plugin
+      2. Prompts for a Cloudflare API token and writes it to
+         /root/.secrets/cloudflare.ini with strict 600 permissions
+      3. Patches the existing renewal config for the chosen domain so Certbot
+         uses dns-cloudflare from the next renewal onward (no re-issuance)
+      4. Creates a deploy hook that reloads Nginx after each successful renewal
+      5. Enables and verifies the systemd certbot.timer
+      6. Runs a --dry-run to confirm everything works before committing
+
+    Guards:
+      - Aborts if the domain has no existing cert / renewal config
+      - Backs up the renewal config before patching
+      - Validates all user inputs; never writes empty or whitespace values
+      - Token is only stored in a root-only file, never logged or printed
+    """
+
+    SECRETS_DIR       = "/root/.secrets"
+    CF_CREDS_FILE     = f"{SECRETS_DIR}/cloudflare.ini"
+    DEPLOY_HOOK_DIR   = "/etc/letsencrypt/renewal-hooks/deploy"
+    DEPLOY_HOOK_FILE  = f"{DEPLOY_HOOK_DIR}/reload-nginx.sh"
+    RENEWAL_BASE_DIR  = "/etc/letsencrypt/renewal"
+
+    os.system('clear')
+    print("\033[1;36m" + "=" * 60)
+    print("     Configure DNS-01 SSL Auto-Renewal (Cloudflare)        ")
+    print("=" * 60 + "\033[0m")
+    print()
+    print("This option migrates your existing cert's renewal method")
+    print("to DNS-01 via Cloudflare — no need to re-issue the cert.")
+    print()
+
+    # -------------------------------------------------------------------------
+    # Step 1 — Domain input & guard: renewal config must already exist
+    # -------------------------------------------------------------------------
+    print("\033[1;34m[Step 1/6] Domain\033[0m")
+    print(" Enter the domain whose SSL cert you want to configure.")
+    print(" The cert must already exist (issued via certbot --nginx or similar).")
+    print()
+
+    while True:
+        domain_input = input(" -> Domain (e.g. example.com): ").strip()
+        if not domain_input:
+            print("\033[1;31m[Error]\033[0m Domain cannot be empty.")
+            continue
+        if not re.match(r'^[a-zA-Z0-9._-]+$', domain_input):
+            print("\033[1;31m[Error]\033[0m Invalid domain format.")
+            continue
+
+        renewal_conf = f"{RENEWAL_BASE_DIR}/{domain_input}.conf"
+        if not os.path.exists(renewal_conf):
+            print(f"\033[1;31m[Error]\033[0m No renewal config found at: {renewal_conf}")
+            print("        Make sure a cert has already been issued for this domain.")
+            print("        Example: certbot --nginx -d {domain_input}")
+            print()
+            retry = input(" Try a different domain? [y/N]: ").strip().lower()
+            if retry != 'y':
+                print("Aborted. Press Enter to return to the main menu...")
+                input()
+                return
+            continue
+        break
+
+    print(f"\033[1;32m -> Found renewal config: {renewal_conf}\033[0m")
+    print()
+
+    # -------------------------------------------------------------------------
+    # Step 2 — Cloudflare API token instructions & input
+    # -------------------------------------------------------------------------
+    print("\033[1;34m[Step 2/6] Cloudflare API Token\033[0m")
+    print()
+    print("  How to create your token:")
+    print("  1. Go to: https://dash.cloudflare.com/profile/api-tokens")
+    print("  2. Click  'Create Token'")
+    print("  3. Use 'Create Custom Token', set these permissions:")
+    print("       Zone → DNS  → Edit")
+    print("       Zone → Zone → Read")
+    print("  4. Under 'Zone Resources': Include → Specific zone → <your domain>")
+    print("     (Do NOT select 'All zones' — limit scope for security)")
+    print("  5. Create the token and copy it here.")
+    print()
+    print("  \033[1;33m[!] The token will be stored in a root-only file and never")
+    print("      displayed again after this step.\033[0m")
+    print()
+
+    while True:
+        cf_token = input(" -> Paste API token: ").strip()
+        if not cf_token:
+            print("\033[1;31m[Error]\033[0m Token cannot be empty.")
+            continue
+        if re.search(r'\s', cf_token):
+            print("\033[1;31m[Error]\033[0m Token must not contain whitespace.")
+            continue
+        # Basic sanity: Cloudflare tokens are alphanumeric + hyphens, ~40 chars
+        if len(cf_token) < 20:
+            print("\033[1;31m[Error]\033[0m Token looks too short. Please paste the full token.")
+            continue
+        break
+
+    print()
+
+    # -------------------------------------------------------------------------
+    # Step 3 — Install certbot-dns-cloudflare plugin
+    # -------------------------------------------------------------------------
+    print("\033[1;34m[Step 3/6] Installing certbot-dns-cloudflare plugin...\033[0m")
+    if not run_cmd("apt-get install -y python3-certbot-dns-cloudflare"):
+        print("\033[1;31m[ERROR]\033[0m Failed to install python3-certbot-dns-cloudflare.")
+        print("        Check your internet connection or apt sources.")
+        print("Press Enter to return to the main menu...")
+        input()
+        return
+    print("\033[1;32m -> Plugin installed.\033[0m")
+    print()
+
+    # -------------------------------------------------------------------------
+    # Step 4 — Write credentials file with strict permissions
+    # -------------------------------------------------------------------------
+    print("\033[1;34m[Step 4/6] Writing Cloudflare credentials...\033[0m")
+    try:
+        os.makedirs(SECRETS_DIR, mode=0o700, exist_ok=True)
+        with open(CF_CREDS_FILE, 'w') as f:
+            f.write(f"dns_cloudflare_api_token = {cf_token}\n")
+        os.chmod(CF_CREDS_FILE, 0o600)
+        # Immediately discard token from memory (best-effort in Python)
+        del cf_token
+    except OSError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Could not write credentials file: {e}")
+        print("Press Enter to return to the main menu...")
+        input()
+        return
+    print(f"\033[1;32m -> Credentials saved to {CF_CREDS_FILE} (chmod 600).\033[0m")
+    print()
+
+    # -------------------------------------------------------------------------
+    # Step 5 — Patch the renewal config (with backup)
+    # -------------------------------------------------------------------------
+    print("\033[1;34m[Step 5/6] Patching renewal config...\033[0m")
+
+    # Backup before touching anything
+    backup_path = f"{renewal_conf}.bak"
+    try:
+        import shutil
+        shutil.copy2(renewal_conf, backup_path)
+    except OSError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Could not create backup: {e}")
+        print("Press Enter to return to the main menu...")
+        input()
+        return
+    print(f" -> Backup saved: {backup_path}")
+
+    try:
+        with open(renewal_conf, 'r') as f:
+            original = f.read()
+
+        lines = original.splitlines()
+        new_lines = []
+        in_renewalparams = False
+
+        # Lines we always want to remove/comment from [renewalparams]
+        OLD_AUTH_KEYS = {
+            'authenticator',
+            'webroot_path',
+            'webroot_map',
+        }
+
+        # DNS-cloudflare lines we will inject (only once)
+        DNS_BLOCK = (
+            "authenticator = dns-cloudflare\n"
+            f"dns_cloudflare_credentials = {CF_CREDS_FILE}\n"
+            "dns_cloudflare_propagation_seconds = 60\n"
+        )
+        dns_block_injected = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            if stripped == '[renewalparams]':
+                in_renewalparams = True
+                new_lines.append(line)
+                # Inject DNS block right after the section header
+                if not dns_block_injected:
+                    new_lines.append(DNS_BLOCK.rstrip('\n'))
+                    dns_block_injected = True
+                continue
+
+            if stripped.startswith('[') and stripped != '[renewalparams]':
+                in_renewalparams = False
+
+            if in_renewalparams:
+                # Comment out old authenticator / webroot lines
+                key = stripped.split('=')[0].strip().lower() if '=' in stripped else ''
+                if key in OLD_AUTH_KEYS:
+                    new_lines.append(f"# [initops-migrated] {line}")
+                    continue
+
+            new_lines.append(line)
+
+        if not dns_block_injected:
+            # [renewalparams] section was absent — append it
+            new_lines.append('')
+            new_lines.append('[renewalparams]')
+            new_lines.append(DNS_BLOCK.rstrip('\n'))
+
+        with open(renewal_conf, 'w') as f:
+            f.write('\n'.join(new_lines) + '\n')
+
+    except OSError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Failed to patch renewal config: {e}")
+        print(f"        Your original config is preserved at: {backup_path}")
+        print("Press Enter to return to the main menu...")
+        input()
+        return
+
+    print(f"\033[1;32m -> {renewal_conf} updated.\033[0m")
+    print()
+
+    # -------------------------------------------------------------------------
+    # Step 6 — Deploy hook + enable certbot.timer + dry-run
+    # -------------------------------------------------------------------------
+    print("\033[1;34m[Step 6/6] Deploy hook, timer & dry-run...\033[0m")
+
+    # Deploy hook: reload nginx after successful renewal
+    try:
+        os.makedirs(DEPLOY_HOOK_DIR, exist_ok=True)
+        hook_content = "#!/bin/bash\nsystemctl reload nginx\n"
+        with open(DEPLOY_HOOK_FILE, 'w') as f:
+            f.write(hook_content)
+        os.chmod(DEPLOY_HOOK_FILE, 0o755)
+        print(f" -> Deploy hook created: {DEPLOY_HOOK_FILE}")
+    except OSError as e:
+        print(f"\033[1;33m[WARNING]\033[0m Could not create deploy hook: {e}")
+        print("         Nginx won't auto-reload after renewal — you can add it manually.")
+
+    # Enable certbot.timer
+    timer_status = subprocess.run(
+        "systemctl is-enabled certbot.timer",
+        shell=True, capture_output=True, text=True
+    )
+    if timer_status.stdout.strip() != "enabled":
+        run_cmd("systemctl enable --now certbot.timer")
+        print(" -> certbot.timer enabled and started.")
+    else:
+        print(" -> certbot.timer already enabled.")
+
+    # Verify timer is actually active
+    timer_active = subprocess.run(
+        "systemctl is-active --quiet certbot.timer",
+        shell=True
+    )
+    if timer_active.returncode != 0:
+        print("\033[1;33m[WARNING]\033[0m certbot.timer is not active. Try: systemctl start certbot.timer")
+    else:
+        print(" -> certbot.timer is active (running twice daily).")
+
+    # Dry-run test
+    print()
+    print(" Running dry-run renewal test (this may take ~60 seconds for DNS propagation)...")
+    print()
+    dry_run_result = subprocess.run(
+        f"certbot renew --dry-run --cert-name {domain_input} --verbose",
+        shell=True, capture_output=True, text=True
+    )
+
+    if dry_run_result.returncode == 0:
+        print("\033[1;32m -> Dry-run passed! DNS-01 renewal is configured correctly.\033[0m")
+    else:
+        print("\033[1;31m[WARNING]\033[0m Dry-run failed. Output:")
+        # Print last 30 lines of stderr for diagnosis — avoids flooding terminal
+        err_lines = (dry_run_result.stderr or dry_run_result.stdout or "").splitlines()
+        for l in err_lines[-30:]:
+            print(f"         {l}")
+        print()
+        print(f"  Your config backup is at: {backup_path}")
+        print("  To revert: cp {backup_path} {renewal_conf}")
+        print()
+        print("  Common causes:")
+        print("   - API token has wrong permissions (needs Zone:DNS:Edit + Zone:Zone:Read)")
+        print("   - DNS has not yet propagated (try again in a few minutes)")
+        print("   - Domain in renewal config does not match Cloudflare zone")
+
+    print()
+    print("=" * 60)
+    print("Press Enter to return to the main menu...")
+    input()
+
 def main():
     check_os()
     sys.stdin = open('/dev/tty', 'r')
@@ -1920,10 +2210,16 @@ def main():
             print(" [7] Add New Website")
         else:
             print(" \033[1;30m[7] Add New Website (Deploy first)\033[0m")
+
+        if is_deployed:
+            print(" [8] Configure DNS-01 SSL Auto-Renewal (Cloudflare)")
+        else:
+            print(" \033[1;30m[8] Configure DNS-01 SSL Auto-Renewal (Deploy first)\033[0m")
+
         print(" [0] Exit")
         print("-" * 60)
 
-        choice = input("Option (0-7): ").strip()
+        choice = input("Option (0-8): ").strip()
 
         if choice == "1":
             if is_deployed:
@@ -2014,6 +2310,14 @@ def main():
                 input()
                 continue
             add_website()
+
+        elif choice == "8":
+            if not is_deployed:
+                print("\n\033[1;33m[WARNING]\033[0m Base stack not deployed yet. Please run Option 1 first.")
+                print("Press Enter to continue...")
+                input()
+                continue
+            setup_cloudflare_ssl()
 
         elif choice == "0":
             print("Exiting.")
