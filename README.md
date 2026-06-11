@@ -1,4 +1,4 @@
-# InitOps v1.5.0
+# InitOps v1.6.0
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
 >
@@ -24,6 +24,7 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 - **Discord Monitoring** — Bilingual server health alerts (EN/VI)
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention (single or all sites)
+- **DNS-01 SSL Auto-Renewal** — Cloudflare DNS challenge for seamless cert renewal
 
 ## Quick Start
 
@@ -114,11 +115,31 @@ Change your domain without breaking anything:
 - Auto-cleanup: deletes backups older than 30 days
 - **Multi-site aware** — backup all sites or select individual ones
 
+### 7. DNS-01 SSL Auto-Renewal via Cloudflare
+Migrate an existing cert to DNS challenge renewal — no re-issuance required, no port 80 dependency:
+
+- Installs `python3-certbot-dns-cloudflare` plugin automatically
+- Stores your API token in `/root/.secrets/cloudflare.ini` with `chmod 600`
+- Patches the existing `/etc/letsencrypt/renewal/<domain>.conf` in-place (backup created first)
+- Sets `dns_cloudflare_propagation_seconds = 60` for reliable TXT record propagation
+- Creates a deploy hook to reload Nginx after each successful renewal
+- Enables and verifies `certbot.timer` (runs twice daily)
+- Runs a `--dry-run` test before finishing to confirm everything works
+
+**Cloudflare API token permissions required:**
+
+| Permission | Access |
+|------------|--------|
+| Zone → DNS | Edit |
+| Zone → Zone | Read |
+
+Set **Zone Resources** to *Include → Specific zone → your domain* — avoid "All zones" for least-privilege security.
+
 ## Interactive Menu
 
 ```
 ============================================================
-                    InitOps v1.5.0
+                    InitOps v1.6.0
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
  [Optimization Profile]: Standard (3.5 – 6 GB | e.g. 4 GB VPS)
@@ -130,9 +151,10 @@ Change your domain without breaking anything:
  [5] Backup WordPress Database
  [6] Server Monitor (Discord Webhook)
  [7] Add New Website
+ [8] Configure DNS-01 SSL Auto-Renewal (Cloudflare)
  [0] Exit
 ------------------------------------------------------------
-Option (0-7):
+Option (0-8):
 ```
 
 ## Configuration Files
@@ -149,6 +171,8 @@ Option (0-7):
 | Sites Registry | `/etc/.initops_websites.conf` |
 | Monitor Config | `/etc/.initops_pulse.conf` |
 | Monitor Script | `/usr/local/bin/init-server-pulse.sh` |
+| Cloudflare Credentials | `/root/.secrets/cloudflare.ini` |
+| Certbot Deploy Hook | `/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh` |
 
 ## Post-Deployment Checklist
 
