@@ -1304,7 +1304,7 @@ send_discord() {
     local COLOR="${3:-15418949}"
     local TS FOOTER
     TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    FOOTER=$(t embed_footer "version=${VERSION:-1.5.0}")
+    FOOTER=$(t embed_footer "version=${VERSION:-1.6.0}")
 
     curl -s -o /dev/null \
         -H "Content-Type: application/json" \
@@ -2176,6 +2176,7 @@ def setup_cloudflare_ssl():
     print("Press Enter to return to the main menu...")
     input()
 
+
 def main():
     check_os()
     sys.stdin = open('/dev/tty', 'r')
@@ -2196,16 +2197,31 @@ def main():
         else:
             print(" \033[1;30m[1] Deploy LEMP Stack & WordPress (ALREADY INSTALLED)\033[0m")
 
-        print(" [2] Re-apply Performance Optimizations (Use after server upgrade)")
-        print(" [3] Help & Tuning Paths")
+        if is_deployed:
+            print(" [2] Re-apply Performance Optimizations (Use after server upgrade)")
+        else:
+            print(" \033[1;30m[2] Re-apply Performance Optimizations (Deploy first)\033[0m")
+
+        if is_deployed:
+            print(" [3] Help & Tuning Paths")
+        else:
+            print(" \033[1;30m[3] Help & Tuning Paths (Deploy first)\033[0m")
 
         if is_deployed:
             print(" [4] Change Domain & Renew SSL")
         else:
             print(" \033[1;30m[4] Change Domain & Renew SSL (Deploy first)\033[0m")
 
-        print(" [5] Backup WordPress Database")
-        print(" [6] Server Monitor (Discord Webhook)")
+        if is_deployed:
+            print(" [5] Backup WordPress Database")
+        else:
+            print(" \033[1;30m[5] Backup WordPress Database (Deploy first)\033[0m")
+
+        if is_deployed:
+            print(" [6] Server Monitor (Discord Webhook)")
+        else:
+            print(" \033[1;30m[6] Server Monitor (Discord Webhook) (Deploy first)\033[0m")
+
         if is_deployed:
             print(" [7] Add New Website")
         else:
@@ -2280,6 +2296,11 @@ def main():
             input()
 
         elif choice == "3":
+            if not is_deployed:
+                print("\n\033[1;33m[WARNING]\033[0m Base stack not deployed yet. Please run Option 1 first.")
+                print("Press Enter to continue...")
+                input()
+                continue
             print_help_menu()
 
         elif choice == "4":
@@ -2301,6 +2322,11 @@ def main():
             backup_database()
 
         elif choice == "6":
+            if not is_deployed:
+                print("\n\033[1;33m[WARNING]\033[0m Base stack not deployed yet. Please run Option 1 first.")
+                print("Press Enter to continue...")
+                input()
+                continue
             setup_server_monitor()
 
         elif choice == "7":
