@@ -168,6 +168,99 @@ def setup_fail2ban():
 
     print("\033[1;32m -> Fail2Ban active: SSH brute-force protection enabled.\033[0m")
 
+def setup_kernel_tuning():
+    print("\033[1;32m[*] Applying OS Network & Kernel Tuning (TCP BBR & Limits)...\033[0m")
+    
+    sysctl_conf = """
+# 1. Optimize File and Monitor Limits
+fs.file-max = 2000000
+fs.inotify.max_user_watches = 524288
+
+# 2. Optimize TCP/IP Stack & Connection Drop Prevention (Spike/Light DDoS)
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_syncookies = 1
+
+# 3. Optimize Connection Lifecycle (Clean up dead sockets)
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.ip_local_port_range = 1024 65000
+
+# 4. Enable TCP BBR (Increase page load speed, reduce latency)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# 5. Optimize Memory Allocation (Crucial for Redis Background Save)
+vm.overcommit_memory = 1
+"""
+    
+    with open('/etc/sysctl.d/99-initops-kernel.conf', 'w') as f:
+        f.write(sysctl_conf.strip() + "\n")
+    
+    run_cmd("sysctl --system")
+    print("\033[1;32m -> Kernel TCP/BBR and limits optimized successfully.\033[0m")
+
+
+def setup_swap(profile):
+    print("\033[1;32m[*] Configuring Swap Space & Storage Optimization...\033[0m")
+    
+    swap_size_gb = 0
+    if profile == "micro":
+        swap_size_gb = 2
+    elif profile == "small":
+        swap_size_gb = 2
+    elif profile == "medium":
+        swap_size_gb = 1
+    else:
+        swap_size_gb = 0
+        
+    if swap_size_gb == 0:
+        print(" -> Profile has sufficient RAM. Skipping Swap allocation to save disk space.")
+        return
+
+    # Check if ANY swap is already active (Partition or File)
+    swap_check = subprocess.run("swapon --show", shell=True, capture_output=True, text=True)
+    if swap_check.stdout.strip():
+        print(" -> System already has an active Swap. Skipping creation to avoid conflicts.")
+    else:
+        swap_file = "/swapfile"
+        print(f" -> Allocating {swap_size_gb}GB Swap space...")
+        run_cmd(f"fallocate -l {swap_size_gb}G {swap_file} || dd if=/dev/zero of={swap_file} bs=1M count={swap_size_gb * 1024}")
+        run_cmd(f"chmod 600 {swap_file}")
+        run_cmd(f"mkswap {swap_file}")
+        run_cmd(f"swapon {swap_file}")
+        
+        # Safely persist Swap via fstab (Avoid duplicates)
+        try:
+            with open("/etc/fstab", "r") as f:
+                fstab_content = f.read()
+            if swap_file not in fstab_content:
+                with open("/etc/fstab", "a") as fstab:
+                    fstab.write(f"\n{swap_file} none swap sw 0 0\n")
+        except Exception as e:
+            print(f"\033[1;33m[WARNING]\033[0m Could not update /etc/fstab: {e}")
+            
+        print(f" -> Created {swap_size_gb}GB Swap file successfully.")
+
+    print(" -> Optimizing Kernel Swappiness & Cache Pressure...")
+    swap_sysctl = """
+# Force OS to prioritize RAM. Only use Swap when RAM is critically low (< 10%)
+vm.swappiness = 10
+# Keep Filesystem Cache (Inodes/Dentries) in RAM longer to accelerate Nginx/Log I/O
+vm.vfs_cache_pressure = 50
+"""
+    kernel_conf_path = '/etc/sysctl.d/99-initops-kernel.conf'
+    mode = 'a' if os.path.exists(kernel_conf_path) else 'w'
+    with open(kernel_conf_path, mode) as f:
+        f.write("\n" + swap_sysctl.strip() + "\n")
+        
+    run_cmd("sysctl --system")
+    print("\033[1;32m -> Swap memory optimized (Swappiness set to 10).\033[0m")
+
 def apply_tuning(profile, ram_mb, cpu_cores):
     print(f"\033[1;32m[*] Applying performance optimizations for: {profile.upper()}...\033[0m")
 
@@ -736,6 +829,8 @@ def print_help_menu():
     print(" WP Config:         /var/www/html/wp-config.php")
     print(" Fail2Ban Config:   /etc/fail2ban/jail.local")
     print(" System Cron:       crontab -u www-data -l")
+    print(" Kernel Tuning:     /etc/sysctl.d/99-initops-kernel.conf")
+    print(" OS Swap File:      /swapfile (dynamically managed)")
     print("-" * 60)
     print(" \033[1;36m--- Server Monitor (Pulse) ---\033[0m")
     print(f" Pulse Config:      {PULSE_CONFIG_FILE}")
@@ -2254,6 +2349,8 @@ def main():
             install_packages()
             setup_firewall()
             setup_fail2ban()
+            setup_kernel_tuning()
+            setup_swap(profile)
             apply_tuning(profile, ram, cpu)
             db_pass = deploy_wordpress(domain, db_name, db_user, db_prefix)
             setup_system_cron()
