@@ -213,7 +213,8 @@ Option (0-8):
    ```
    *(Or use Option [4] in the InitOps menu for full migration)*
 3. **Secure your credentials** — the DB password is shown once during deployment
-4. **Install a caching plugin** (e.g., W3 Total Cache) and point it to Redis
+4. **Install Redis Object Cache** and enable object caching in WordPress
+5. *(Optional)* Install a page caching plugin such as **W3 Total Cache** if additional page caching, browser caching, or CDN integration is desired
 
 ## Adding More Sites
 
