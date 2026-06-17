@@ -74,7 +74,37 @@ Each profile tunes:
 - MariaDB `innodb_buffer_pool_size` (up to 45% of RAM)
 - Redis `maxmemory` & eviction policies
 
-### 2. Multi-Site on One VPS
+### 2. Kernel & TCP Stack Tuning
+
+InitOps automatically applies a comprehensive kernel tuning set to maximize network throughput, stabilize connections, and accelerate response times:
+
+- **TCP BBR** — Enables the BBR congestion control algorithm instead of Cubic, significantly reducing latency and improving page load speed.
+- **File Limits** — Raises `fs.file-max` to 2,000,000 and `fs.inotify.max_user_watches` to 524,288, ensuring Nginx + PHP-FPM are not descriptor-bound under high traffic.
+- **Connection Backlog** — Pushes `net.core.somaxconn`, `tcp_max_syn_backlog`, and `netdev_max_backlog` to 65,535, combined with `tcp_syncookies = 1` to mitigate SYN flood / light DDoS spikes.
+- **Socket Lifecycle** — Enables `tcp_tw_reuse`, lowers `tcp_fin_timeout` to 15s, fine-tunes keepalive probes (600s / 30s / 5 attempts), and expands `ip_local_port_range` to 1024–65000 for efficient port reuse.
+- **Redis Background Save** — Sets `vm.overcommit_memory = 1` to prevent OOM failures when Redis performs BGSAVE on memory-constrained VPS.
+
+All configurations are written to `/etc/sysctl.d/99-initops-kernel.conf` and applied immediately via `sysctl --system` — no reboot required.
+
+### 3. Intelligent Swap Management
+
+InitOps does not create swap rigidly for every profile; instead, it **allocates dynamically based on actual RAM capacity**:
+
+| Profile | RAM Range | Swap Allocation |
+|---------|-----------|-----------------|
+| `micro` | &lt; 1.5 GB | **2 GB swap file** |
+| `small` | 1.5 – 3.5 GB | **2 GB swap file** |
+| `standard` | 3.5 – 6 GB | **1 GB swap file** |
+| `medium` and above | ≥ 6 GB | **None** — prioritizes keeping workload in physical RAM |
+
+If the system already has an active swap (partition or file), InitOps **auto-detects and skips** to avoid conflicts. The swap file is persisted via `/etc/fstab` with `chmod 600` permissions.
+
+Alongside swap, InitOps tunes two additional critical kernel parameters:
+
+- `vm.swappiness = 10` — Forces the kernel to prioritize RAM usage, only swapping when RAM is critically low (&lt; 10%).
+- `vm.vfs_cache_pressure = 50` — Keeps inode/dentry cache in RAM longer, accelerating Nginx and log rotation I/O.
+
+### 4. Multi-Site on One VPS
 Deploy multiple independent WordPress sites on the same server:
 
 - Each site gets its own **database**, **Redis DB index**, and **Nginx vhost**
@@ -83,13 +113,13 @@ Deploy multiple independent WordPress sites on the same server:
 - Per-site WP-Cron via `flock` to prevent overlapping processes
 - Backup supports **all sites at once** or **individual selection**
 
-### 3. Security by Default
+### 5. Security by Default
 - **iptables** — Ports 22, 80, 443 only
 - **Fail2Ban** — SSH brute-force protection (5 retries / 1h ban)
 - **Socket Mode** — MariaDB & Redis communicate via Unix sockets (no TCP exposure)
 - **WP Hardening** — `DISALLOW_FILE_EDIT`, disabled XML-RPC, cron offloaded to system
 
-### 4. Discord Server Monitor
+### 6. Discord Server Monitor
 Bilingual (English / Vietnamese) webhook alerting for:
 - Disk space critical
 - RAM exhaustion
@@ -99,14 +129,14 @@ Bilingual (English / Vietnamese) webhook alerting for:
 
 Profile-aware cron intervals (every 5–10 minutes).
 
-### 5. One-Shot Domain Migration
+### 7. One-Shot Domain Migration
 Change your domain without breaking anything:
 - Updates Nginx vhost
 - Issues new SSL via Certbot
 - Performs precise DB search-replace (respects serialized data)
 - Flushes Redis cache automatically
 
-### 6. Database Backups
+### 8. Database Backups
 ```
 /var/backups/wordpress/wp_db_<domain>_<YYYYMMDD_HHMMSS>.sql.gz
 ```
@@ -115,7 +145,7 @@ Change your domain without breaking anything:
 - Auto-cleanup: deletes backups older than 30 days
 - **Multi-site aware** — backup all sites or select individual ones
 
-### 7. DNS-01 SSL Auto-Renewal via Cloudflare
+### 9. DNS-01 SSL Auto-Renewal via Cloudflare
 Migrate an existing cert to DNS challenge renewal — no re-issuance required, no port 80 dependency:
 
 - Installs `python3-certbot-dns-cloudflare` plugin automatically
