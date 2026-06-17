@@ -213,7 +213,7 @@ def setup_swap(profile):
         swap_size_gb = 2
     elif profile == "small":
         swap_size_gb = 2
-    elif profile == "medium":
+    elif profile == "standard":
         swap_size_gb = 1
     else:
         swap_size_gb = 0
