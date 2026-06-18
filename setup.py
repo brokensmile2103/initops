@@ -9,7 +9,7 @@ import json
 import urllib.request
 import urllib.error
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -102,8 +102,8 @@ def validate_domain(prompt, default_value="_"):
             return user_input
         print("\033[1;31m[Error]\033[0m Invalid domain format. Use alphanumeric characters, dots, and hyphens only.")
 
-def install_packages():
-    print("\n\033[1;32m[*] Installing LEMP stack, Certbot & Firewall...\033[0m")
+def install_packages(php_ver="8.3"):
+    print(f"\n\033[1;32m[*] Installing LEMP stack (PHP {php_ver}), Certbot & Firewall...\033[0m")
     os.environ["DEBIAN_FRONTEND"] = "noninteractive"
 
     run_cmd("apt-get update")
@@ -116,18 +116,19 @@ def install_packages():
     run_cmd("add-apt-repository -y ppa:ondrej/php")
     run_cmd("apt-get update")
 
+    v = php_ver
     packages = (
-        "nginx mariadb-server redis-server "
-        "php8.3-fpm php8.3-mysql php8.3-redis php8.3-bcmath php8.3-opcache "
-        "php8.3-mbstring php8.3-intl "
-        "php8.3-gd php8.3-imagick "
-        "php8.3-xml php8.3-xmlrpc "
-        "php8.3-curl "
-        "php8.3-zip php8.3-soap "
-        "php8.3-exif "
-        "imagemagick "
-        "certbot python3-certbot-nginx "
-        "iptables iptables-persistent"
+        f"nginx mariadb-server redis-server "
+        f"php{v}-fpm php{v}-mysql php{v}-redis php{v}-bcmath php{v}-opcache "
+        f"php{v}-mbstring php{v}-intl "
+        f"php{v}-gd php{v}-imagick "
+        f"php{v}-xml php{v}-xmlrpc "
+        f"php{v}-curl "
+        f"php{v}-zip php{v}-soap "
+        f"php{v}-exif "
+        f"imagemagick "
+        f"certbot python3-certbot-nginx "
+        f"iptables iptables-persistent"
     )
     run_cmd(f"apt-get install -y {packages}")
     print("\033[1;32m -> System packages deployed successfully.\033[0m")
@@ -261,7 +262,7 @@ vm.vfs_cache_pressure = 50
     run_cmd("sysctl --system")
     print("\033[1;32m -> Swap memory optimized (Swappiness set to 10).\033[0m")
 
-def apply_tuning(profile, ram_mb, cpu_cores):
+def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
     print(f"\033[1;32m[*] Applying performance optimizations for: {profile.upper()}...\033[0m")
 
     # -------------------------------------------------------------------------
@@ -366,7 +367,7 @@ def apply_tuning(profile, ram_mb, cpu_cores):
     # -------------------------------------------------------------------------
     # 2. PHP-FPM pool
     # -------------------------------------------------------------------------
-    fpm_pool_conf = "/etc/php/8.3/fpm/pool.d/z_custom_pm.conf"
+    fpm_pool_conf = f"/etc/php/{php_ver}/fpm/pool.d/z_custom_pm.conf"
 
     if profile == "micro":
         fpm_conf = (
@@ -416,7 +417,7 @@ def apply_tuning(profile, ram_mb, cpu_cores):
         f.write(fpm_conf)
 
     # Named explicitly so it never collides with user-managed opcache config files
-    php_ini_dropin = "/etc/php/8.3/fpm/conf.d/99-initops-runtime.ini"
+    php_ini_dropin = f"/etc/php/{php_ver}/fpm/conf.d/99-initops-runtime.ini"
 
     if profile == "micro":
         mem_limit = "128M"
@@ -627,7 +628,7 @@ def apply_tuning(profile, ram_mb, cpu_cores):
     print("\n\033[1;34m[*] Validating configurations...\033[0m")
 
     php_check = subprocess.run(
-        "php-fpm8.3 -t", shell=True,
+        f"php-fpm{php_ver} -t", shell=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     if php_check.returncode != 0:
@@ -650,10 +651,10 @@ def apply_tuning(profile, ram_mb, cpu_cores):
     run_cmd("systemctl daemon-reload")
 
     services = {
-        "redis-server": "Redis",
-        "mariadb":      "MariaDB",
-        "php8.3-fpm":   "PHP-FPM",
-        "nginx":        "Nginx",
+        "redis-server":           "Redis",
+        "mariadb":                "MariaDB",
+        f"php{php_ver}-fpm":      "PHP-FPM",
+        "nginx":                  "Nginx",
     }
 
     for svc, name in services.items():
@@ -667,7 +668,46 @@ def apply_tuning(profile, ram_mb, cpu_cores):
 
     print("\033[1;32m -> All services optimized and verified healthy.\033[0m")
 
-def deploy_wordpress(domain, db_name, db_user, db_prefix):
+def setup_mariadb_secure():
+    """Hardens MariaDB root account and removes insecure defaults.
+    Equivalent to mysql_secure_installation — runs non-interactively.
+    Idempotent: skips if root access is already locked down.
+    """
+    print("\033[1;32m[*] Hardening MariaDB (secure installation)...\033[0m")
+
+    # Check if root can still connect passwordlessly (not yet secured)
+    check = subprocess.run(
+        ["mysql", "-u", "root", "-e", "SELECT 1;"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    if check.returncode != 0:
+        print(" -> MariaDB root already secured. Skipping.")
+        return
+
+    secure_statements = [
+        # Remove anonymous users
+        "DELETE FROM mysql.global_priv WHERE User='' OR User IS NULL;",
+        # Disallow remote root login (keep only localhost / loopback)
+        "DELETE FROM mysql.global_priv WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');",
+        # Remove test database
+        "DROP DATABASE IF EXISTS test;",
+        "DELETE FROM mysql.db WHERE Db='test' OR Db LIKE 'test\\_%';",
+        # Apply changes
+        "FLUSH PRIVILEGES;",
+    ]
+
+    for stmt in secure_statements:
+        result = subprocess.run(
+            ["mysql", "-u", "root", "-e", stmt],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"\033[1;33m[WARNING]\033[0m MariaDB hardening step failed: {result.stderr.strip()[:200]}")
+
+    print("\033[1;32m -> MariaDB: anonymous users removed, remote root disabled, test DB dropped.\033[0m")
+
+
+def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver="8.3"):
     print("\n\033[1;32m[*] Deploying WordPress...\033[0m")
 
     wp_path = "/var/www/html"
@@ -748,7 +788,7 @@ def deploy_wordpress(domain, db_name, db_user, db_prefix):
 
     location ~ \\.php$ {{
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_pass unix:/run/php/php{php_ver}-fpm.sock;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         include fastcgi_params;
         fastcgi_hide_header X-Powered-By;
@@ -817,13 +857,14 @@ def setup_system_cron():
     print("\033[1;32m -> System Cron configured: WP-Cron runs every minute via www-data.\033[0m")
 
 def print_help_menu():
+    _pv = _detect_php_ver()
     print("\n\033[1;36m--- Configuration File Locations ---\033[0m")
     print(" Nginx Main Config: /etc/nginx/nginx.conf")
     print(" Nginx Vhost:       /etc/nginx/sites-available/wordpress")
     print(" Plugin Nginx Rules:/var/www/html/nginx.conf")
-    print(" PHP-FPM Pool:      /etc/php/8.3/fpm/pool.d/z_custom_pm.conf")
-    print(" PHP INI Tuning:    /etc/php/8.3/fpm/conf.d/99-initops-runtime.ini")
-    print(" OPcache Config:    /etc/php/8.3/fpm/conf.d/  (manage separately)")
+    print(f" PHP-FPM Pool:      /etc/php/{_pv}/fpm/pool.d/z_custom_pm.conf")
+    print(f" PHP INI Tuning:    /etc/php/{_pv}/fpm/conf.d/99-initops-runtime.ini")
+    print(f" OPcache Config:    /etc/php/{_pv}/fpm/conf.d/  (manage separately)")
     print(" MariaDB Tuning:    /etc/mysql/conf.d/z_custom_optimize.cnf")
     print(" Redis Config:      /etc/redis/redis.conf")
     print(" WP Config:         /var/www/html/wp-config.php")
@@ -1399,7 +1440,7 @@ send_discord() {
     local COLOR="${3:-15418949}"
     local TS FOOTER
     TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    FOOTER=$(t embed_footer "version=${VERSION:-1.6.0}")
+    FOOTER=$(t embed_footer "version=${VERSION:-1.7.0}")
 
     curl -s -o /dev/null \
         -H "Content-Type: application/json" \
@@ -1724,6 +1765,34 @@ def _get_next_redis_db():
         db += 1
     return db
 
+def _detect_php_ver():
+    """Detect the active PHP-FPM version installed on the server (8.3 or 8.4).
+    Priority: lock file (source of truth) → running socket → installed pool dir → fallback 8.3.
+    """
+    # 1. Read from lock file (most reliable — written at deploy time)
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                data = json.load(f)
+            ver = data.get("php_ver", "")
+            if ver in ("8.3", "8.4"):
+                return ver
+        except Exception:
+            pass  # lock file is old plain-text format or corrupt → fall through
+
+    # 2. Check running PHP-FPM socket (server is live)
+    for ver in ("8.4", "8.3"):
+        if os.path.exists(f"/run/php/php{ver}-fpm.sock"):
+            return ver
+
+    # 3. Check installed pool directory (service may be stopped)
+    for ver in ("8.4", "8.3"):
+        if os.path.exists(f"/etc/php/{ver}/fpm/pool.d"):
+            return ver
+
+    return "8.3"  # fallback
+
+
 def add_website():
     """[7] Add a new WordPress website to the same server.
     - Provisions a new DB, WP-CLI install, Nginx vhost, and Redis DB index.
@@ -1784,7 +1853,8 @@ def add_website():
         input()
         return
 
-    print(f"\n\033[1;32m[*] Deploying WordPress to {wp_path}...\033[0m")
+    php_ver = _detect_php_ver()
+    print(f"\n\033[1;32m[*] Deploying WordPress to {wp_path} (PHP {php_ver})...\033[0m")
 
     os.makedirs(wp_path, exist_ok=True)
 
@@ -1875,7 +1945,7 @@ def add_website():
 
     location ~ \\.php$ {{
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_pass unix:/run/php/php{php_ver}-fpm.sock;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         include fastcgi_params;
         fastcgi_hide_header X-Powered-By;
@@ -2341,27 +2411,54 @@ def main():
                 continue
 
             print("\n\033[1;34m--- Deployment Configuration ---\033[0m")
+
+            # PHP version selection
+            while True:
+                print(" PHP Version:")
+                print("   [1] PHP 8.3 (stable, recommended)")
+                print("   [2] PHP 8.4 (latest)")
+                php_choice = input("-> Select PHP version [Default: 1]: ").strip()
+                if php_choice in ("", "1"):
+                    php_ver = "8.3"
+                    break
+                elif php_choice == "2":
+                    php_ver = "8.4"
+                    break
+                else:
+                    print("\033[1;31m[Error]\033[0m Please enter 1 or 2.")
+            print(f"\033[1;32m -> PHP {php_ver} selected.\033[0m\n")
+
             domain    = validate_domain("-> Domain name (e.g. site.com) [Default: _]: ")
             db_name   = validate_input("-> Database name   [Default: wp_production]: ", "wp_production")
             db_user   = f"wp_user_{secrets.randbelow(8999) + 1000}"
             db_prefix = validate_input("-> Table prefix    [Default: wp_]:           ", "wp_", r'^[a-zA-Z0-9_]+$')
 
-            install_packages()
+            install_packages(php_ver)
             setup_firewall()
             setup_fail2ban()
             setup_kernel_tuning()
             setup_swap(profile)
-            apply_tuning(profile, ram, cpu)
-            db_pass = deploy_wordpress(domain, db_name, db_user, db_prefix)
+            apply_tuning(profile, ram, cpu, php_ver)
+            setup_mariadb_secure()
+            db_pass = deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver)
             setup_system_cron()
 
             with open(LOCK_FILE, 'w') as f:
-                f.write("deployed")
+                json.dump({
+                    "deployed": True,
+                    "version":  VERSION,
+                    "php_ver":  php_ver,
+                    "domain":   domain,
+                    "db_name":  db_name,
+                    "deployed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }, f, indent=2)
+            os.chmod(LOCK_FILE, 0o600)
 
             print("\n\033[1;32m" + "=" * 60)
             print("              Deployment completed successfully               ")
             print("=" * 60 + "\033[0m")
             print(f" -> Version:           {VERSION}")
+            print(f" -> PHP Version:       {php_ver}")
             print(f" -> Web root:          /var/www/html")
             print(f" -> Domain:            {domain if domain != '_' else 'Direct Public IP'}")
             print(f" -> Database:          {db_name}")
@@ -2388,7 +2485,9 @@ def main():
 
             print("\n\033[1;34m--- Re-applying Optimizations ---\033[0m")
             print("Detecting latest hardware specs...")
-            apply_tuning(profile, ram, cpu)
+            php_ver = _detect_php_ver()
+            print(f" -> PHP version detected: {php_ver}")
+            apply_tuning(profile, ram, cpu, php_ver)
             print("\nPress Enter to return to the main menu...")
             input()
 
