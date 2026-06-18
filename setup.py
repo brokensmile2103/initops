@@ -609,7 +609,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         f"sort_buffer_size = {sort_buf}\n"
         f"read_rnd_buffer_size = {rnd_buf}\n"
         "slow_query_log = 1\n"
-        "long_query_time = 1\n"
+        "long_query_time = 2\n"
         "log_queries_not_using_indexes = 0\n"
         "skip_log_bin\n"
         "skip_name_resolve\n"
