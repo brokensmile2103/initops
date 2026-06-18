@@ -1,4 +1,4 @@
-# InitOps v1.6.0
+# InitOps v1.7.0
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
 >
@@ -6,7 +6,7 @@
 
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Nginx](https://img.shields.io/badge/Nginx-1.24+-009639?logo=nginx&logoColor=white)](https://nginx.org/)
-[![PHP](https://img.shields.io/badge/PHP-8.3-777BB4?logo=php&logoColor=white)](https://www.php.net/)
+[![PHP](https://img.shields.io/badge/PHP-8.3%2F8.4-777BB4?logo=php&logoColor=white)](https://www.php.net/)
 [![MariaDB](https://img.shields.io/badge/MariaDB-10.11+-003545?logo=mariadb&logoColor=white)](https://mariadb.org/)
 [![Redis](https://img.shields.io/badge/Redis-7.0+-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -17,7 +17,7 @@
 
 No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a few prompts, and get:
 
-- **LEMP Stack** — Nginx, MariaDB, PHP 8.3-FPM, Redis
+- **LEMP Stack** — Nginx, MariaDB, PHP 8.3/8.4-FPM, Redis
 - **Security Hardening** — iptables firewall, Fail2Ban, socket-only DB/Redis
 - **Auto-Tuned Performance** — 6 hardware profiles (micro → xlarge)
 - **Multi-Site Support** — Deploy multiple WordPress sites on the same VPS
@@ -25,6 +25,7 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention (single or all sites)
 - **DNS-01 SSL Auto-Renewal** — Cloudflare DNS challenge for seamless cert renewal
+- **PHP Version Choice** — Select PHP 8.3 (stable) or 8.4 (latest) during deployment
 
 ## Quick Start
 
@@ -92,7 +93,7 @@ InitOps does not create swap rigidly for every profile; instead, it **allocates 
 
 | Profile | RAM Range | Swap Allocation |
 |---------|-----------|-----------------|
-| `micro` | &lt; 1.5 GB | **2 GB swap file** |
+| `micro` | < 1.5 GB | **2 GB swap file** |
 | `small` | 1.5 – 3.5 GB | **2 GB swap file** |
 | `standard` | 3.5 – 6 GB | **1 GB swap file** |
 | `medium` and above | ≥ 6 GB | **None** — prioritizes keeping workload in physical RAM |
@@ -101,7 +102,7 @@ If the system already has an active swap (partition or file), InitOps **auto-det
 
 Alongside swap, InitOps tunes two additional critical kernel parameters:
 
-- `vm.swappiness = 10` — Forces the kernel to prioritize RAM usage, only swapping when RAM is critically low (&lt; 10%).
+- `vm.swappiness = 10` — Forces the kernel to prioritize RAM usage, only swapping when RAM is critically low (< 10%).
 - `vm.vfs_cache_pressure = 50` — Keeps inode/dentry cache in RAM longer, accelerating Nginx and log rotation I/O.
 
 ### 4. Multi-Site on One VPS
@@ -131,10 +132,11 @@ Profile-aware cron intervals (every 5–10 minutes).
 
 ### 7. One-Shot Domain Migration
 Change your domain without breaking anything:
-- Updates Nginx vhost
+- Updates Nginx vhost with **config validation before applying**
 - Issues new SSL via Certbot
 - Performs precise DB search-replace (respects serialized data)
 - Flushes Redis cache automatically
+- **Auto-rollback** if Nginx validation fails
 
 ### 8. Database Backups
 ```
@@ -165,11 +167,21 @@ Migrate an existing cert to DNS challenge renewal — no re-issuance required, n
 
 Set **Zone Resources** to *Include → Specific zone → your domain* — avoid "All zones" for least-privilege security.
 
+### 10. PHP 8.3 or 8.4 — Your Choice
+InitOps v1.7.0 lets you **select your PHP version** during deployment:
+
+| Version | Status | Best For |
+|---------|--------|----------|
+| **8.3** | Stable, recommended | Production environments, maximum compatibility |
+| **8.4** | Latest | New features, improved JIT performance |
+
+After deployment, the system **auto-detects** your running PHP version when you select **Re-apply Performance Optimizations** — no manual edits needed.
+
 ## Interactive Menu
 
 ```
 ============================================================
-                    InitOps v1.6.0
+                    InitOps v1.7.0
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
  [Optimization Profile]: Standard (3.5 – 6 GB | e.g. 4 GB VPS)
@@ -193,8 +205,8 @@ Option (0-8):
 |-----------|------|
 | Nginx Main | `/etc/nginx/nginx.conf` |
 | Nginx Vhost (default) | `/etc/nginx/sites-available/wordpress` |
-| PHP-FPM Pool | `/etc/php/8.3/fpm/pool.d/z_custom_pm.conf` |
-| PHP Tuning | `/etc/php/8.3/fpm/conf.d/99-initops-runtime.ini` |
+| PHP-FPM Pool | `/etc/php/{8.3,8.4}/fpm/pool.d/z_custom_pm.conf` |
+| PHP Tuning | `/etc/php/{8.3,8.4}/fpm/conf.d/99-initops-runtime.ini` |
 | MariaDB Tuning | `/etc/mysql/conf.d/z_custom_optimize.cnf` |
 | Redis Config | `/etc/redis/redis.conf` |
 | WP Config (default) | `/var/www/html/wp-config.php` |
