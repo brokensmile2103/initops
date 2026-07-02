@@ -9,7 +9,7 @@ import json
 import urllib.request
 import urllib.error
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -117,12 +117,15 @@ def install_packages(php_ver="8.3"):
     run_cmd("apt-get update")
 
     v = php_ver
-    packages = (
+
+    # Core packages: must exist for every PHP branch we support (8.3/8.4/8.5).
+    # If any of these is missing, something is genuinely wrong (bad PPA/arch) and we abort.
+    core_packages = (
         f"nginx mariadb-server redis-server "
-        f"php{v}-fpm php{v}-mysql php{v}-redis php{v}-bcmath php{v}-opcache "
+        f"php{v}-fpm php{v}-mysql php{v}-redis php{v}-bcmath "
         f"php{v}-mbstring php{v}-intl "
         f"php{v}-gd php{v}-imagick "
-        f"php{v}-xml php{v}-xmlrpc "
+        f"php{v}-xml "
         f"php{v}-curl "
         f"php{v}-zip php{v}-soap "
         f"php{v}-exif "
@@ -130,7 +133,37 @@ def install_packages(php_ver="8.3"):
         f"certbot python3-certbot-nginx "
         f"iptables iptables-persistent"
     )
-    run_cmd(f"apt-get install -y {packages}")
+
+    # Optional extensions: package availability varies by PHP branch on the ondrej/php PPA.
+    # e.g. php8.5-opcache no longer exists as a separate .deb because OPcache is compiled
+    # into PHP core starting with 8.5 (always-on by default) — same idea can hit xmlrpc.
+    # We check each one individually so a missing package never aborts the whole apt transaction.
+    optional_extensions = [f"php{v}-opcache", f"php{v}-xmlrpc"]
+    available_optional = []
+    for pkg in optional_extensions:
+        check = subprocess.run(
+            f"apt-cache policy {pkg}", shell=True,
+            capture_output=True, text=True
+        )
+        has_candidate = (
+            check.returncode == 0
+            and "Candidate: (none)" not in check.stdout
+            and "Candidate:" in check.stdout
+        )
+        if not has_candidate:
+            print(f"\033[1;33m -> Skipping {pkg}: not published for PHP {v} "
+                  f"(likely built into core already, e.g. OPcache in PHP 8.5+).\033[0m")
+        else:
+            available_optional.append(pkg)
+
+    packages = core_packages + " " + " ".join(available_optional)
+
+    if not run_cmd(f"apt-get install -y {packages}", ignore_error=True):
+        print(f"\033[1;31m[ERROR]\033[0m Failed to install PHP {v} packages.")
+        print(f"       The ondrej/php PPA may not have fully built all PHP {v} extensions yet")
+        print(f"       for this Ubuntu release/architecture. Try 'apt-cache policy php{v}-fpm'")
+        print(f"       to check package availability, or pick a different PHP version.")
+        sys.exit(1)
     print("\033[1;32m -> System packages deployed successfully.\033[0m")
 
 def setup_firewall():
@@ -341,7 +374,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
     nginx_http = (
         "http {\n"
         "    limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:10m;\n"
-        "    limit_req_zone $binary_remote_addr zone=req_limit_per_ip:10m rate=10r/s;\n"
+        "    limit_req_zone $binary_remote_addr zone=req_limit_per_ip:10m rate=30r/s;\n"
         "    sendfile on; tcp_nopush on; tcp_nodelay on;\n"
         "    types_hash_max_size 2048; server_tokens off;\n"
         "    reset_timedout_connection on;\n"
@@ -781,8 +814,8 @@ def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver="8.3"):
     client_max_body_size 128m;
 
     location / {{
-        limit_conn conn_limit_per_ip 10;
-        limit_req zone=req_limit_per_ip burst=20 nodelay;
+        limit_conn conn_limit_per_ip 30;
+        limit_req zone=req_limit_per_ip burst=60 nodelay;
         try_files $uri $uri/ /index.php?$args;
     }}
 
@@ -1766,27 +1799,29 @@ def _get_next_redis_db():
     return db
 
 def _detect_php_ver():
-    """Detect the active PHP-FPM version installed on the server (8.3 or 8.4).
+    """Detect the active PHP-FPM version installed on the server (8.3, 8.4 or 8.5).
     Priority: lock file (source of truth) → running socket → installed pool dir → fallback 8.3.
     """
+    SUPPORTED_PHP_VERS = ("8.3", "8.4", "8.5")
+
     # 1. Read from lock file (most reliable — written at deploy time)
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, 'r') as f:
                 data = json.load(f)
             ver = data.get("php_ver", "")
-            if ver in ("8.3", "8.4"):
+            if ver in SUPPORTED_PHP_VERS:
                 return ver
         except Exception:
             pass  # lock file is old plain-text format or corrupt → fall through
 
     # 2. Check running PHP-FPM socket (server is live)
-    for ver in ("8.4", "8.3"):
+    for ver in ("8.5", "8.4", "8.3"):
         if os.path.exists(f"/run/php/php{ver}-fpm.sock"):
             return ver
 
     # 3. Check installed pool directory (service may be stopped)
-    for ver in ("8.4", "8.3"):
+    for ver in ("8.5", "8.4", "8.3"):
         if os.path.exists(f"/etc/php/{ver}/fpm/pool.d"):
             return ver
 
@@ -1938,8 +1973,8 @@ def add_website():
     client_max_body_size 128m;
 
     location / {{
-        limit_conn conn_limit_per_ip 10;
-        limit_req zone=req_limit_per_ip burst=20 nodelay;
+        limit_conn conn_limit_per_ip 30;
+        limit_req zone=req_limit_per_ip burst=60 nodelay;
         try_files $uri $uri/ /index.php?$args;
     }}
 
@@ -2416,7 +2451,8 @@ def main():
             while True:
                 print(" PHP Version:")
                 print("   [1] PHP 8.3 (stable, recommended)")
-                print("   [2] PHP 8.4 (latest)")
+                print("   [2] PHP 8.4 (stable)")
+                print("   [3] PHP 8.5 (latest)")
                 php_choice = input("-> Select PHP version [Default: 1]: ").strip()
                 if php_choice in ("", "1"):
                     php_ver = "8.3"
@@ -2424,8 +2460,11 @@ def main():
                 elif php_choice == "2":
                     php_ver = "8.4"
                     break
+                elif php_choice == "3":
+                    php_ver = "8.5"
+                    break
                 else:
-                    print("\033[1;31m[Error]\033[0m Please enter 1 or 2.")
+                    print("\033[1;31m[Error]\033[0m Please enter 1, 2 or 3.")
             print(f"\033[1;32m -> PHP {php_ver} selected.\033[0m\n")
 
             domain    = validate_domain("-> Domain name (e.g. site.com) [Default: _]: ")
