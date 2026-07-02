@@ -1,4 +1,4 @@
-# InitOps v1.7.0
+# InitOps v1.8.0
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
 >
@@ -6,7 +6,7 @@
 
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Nginx](https://img.shields.io/badge/Nginx-1.24+-009639?logo=nginx&logoColor=white)](https://nginx.org/)
-[![PHP](https://img.shields.io/badge/PHP-8.3%2F8.4-777BB4?logo=php&logoColor=white)](https://www.php.net/)
+[![PHP](https://img.shields.io/badge/PHP-8.3%2F8.4%2F8.5-777BB4?logo=php&logoColor=white)](https://www.php.net/)
 [![MariaDB](https://img.shields.io/badge/MariaDB-10.11+-003545?logo=mariadb&logoColor=white)](https://mariadb.org/)
 [![Redis](https://img.shields.io/badge/Redis-7.0+-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -17,7 +17,7 @@
 
 No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a few prompts, and get:
 
-- **LEMP Stack** — Nginx, MariaDB, PHP 8.3/8.4-FPM, Redis
+- **LEMP Stack** — Nginx, MariaDB, PHP 8.3/8.4/8.5-FPM, Redis
 - **Security Hardening** — iptables firewall, Fail2Ban, socket-only DB/Redis
 - **Auto-Tuned Performance** — 6 hardware profiles (micro → xlarge)
 - **Multi-Site Support** — Deploy multiple WordPress sites on the same VPS
@@ -25,7 +25,7 @@ No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a 
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention (single or all sites)
 - **DNS-01 SSL Auto-Renewal** — Cloudflare DNS challenge for seamless cert renewal
-- **PHP Version Choice** — Select PHP 8.3 (stable) or 8.4 (latest) during deployment
+- **PHP Version Choice** — Select PHP 8.3 (stable), 8.4 (stable), or 8.5 (latest) during deployment
 
 ## Quick Start
 
@@ -167,13 +167,14 @@ Migrate an existing cert to DNS challenge renewal — no re-issuance required, n
 
 Set **Zone Resources** to *Include → Specific zone → your domain* — avoid "All zones" for least-privilege security.
 
-### 10. PHP 8.3 or 8.4 — Your Choice
-InitOps v1.7.0 lets you **select your PHP version** during deployment:
+### 10. PHP 8.3, 8.4, or 8.5 — Your Choice
+InitOps v1.8.0 lets you **select your PHP version** during deployment:
 
 | Version | Status | Best For |
 |---------|--------|----------|
 | **8.3** | Stable, recommended | Production environments, maximum compatibility |
-| **8.4** | Latest | New features, improved JIT performance |
+| **8.4** | Stable | Newer features, improved JIT performance |
+| **8.5** | Latest | Bleeding-edge features, testing the newest technology |
 
 After deployment, the system **auto-detects** your running PHP version when you select **Re-apply Performance Optimizations** — no manual edits needed.
 
@@ -181,7 +182,7 @@ After deployment, the system **auto-detects** your running PHP version when you 
 
 ```
 ============================================================
-                    InitOps v1.7.0
+                    InitOps v1.8.0
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
  [Optimization Profile]: Standard (3.5 – 6 GB | e.g. 4 GB VPS)
@@ -205,8 +206,8 @@ Option (0-8):
 |-----------|------|
 | Nginx Main | `/etc/nginx/nginx.conf` |
 | Nginx Vhost (default) | `/etc/nginx/sites-available/wordpress` |
-| PHP-FPM Pool | `/etc/php/{8.3,8.4}/fpm/pool.d/z_custom_pm.conf` |
-| PHP Tuning | `/etc/php/{8.3,8.4}/fpm/conf.d/99-initops-runtime.ini` |
+| PHP-FPM Pool | `/etc/php/{8.3,8.4,8.5}/fpm/pool.d/z_custom_pm.conf` |
+| PHP Tuning | `/etc/php/{8.3,8.4,8.5}/fpm/conf.d/99-initops-runtime.ini` |
 | MariaDB Tuning | `/etc/mysql/conf.d/z_custom_optimize.cnf` |
 | Redis Config | `/etc/redis/redis.conf` |
 | WP Config (default) | `/var/www/html/wp-config.php` |
