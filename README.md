@@ -1,4 +1,4 @@
-# InitOps v1.8.0
+# InitOps v1.9.0
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
 >
@@ -18,14 +18,14 @@
 No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a few prompts, and get:
 
 - **LEMP Stack** — Nginx, MariaDB, PHP 8.3/8.4/8.5-FPM, Redis
-- **Security Hardening** — iptables firewall, Fail2Ban, socket-only DB/Redis
-- **Auto-Tuned Performance** — 6 hardware profiles (micro → xlarge)
+- **Security Hardening** — iptables firewall, Fail2Ban, socket-only DB/Redis, MariaDB secure installation
+- **Auto-Tuned Performance** — 6 hardware profiles (micro → xlarge) with dynamic PHP-FPM sizing and OPcache auto-tuning
+- **PHP Version Manager** — Install, switch, and rollback between PHP 8.3/8.4/8.5 post-deployment with zero downtime
 - **Multi-Site Support** — Deploy multiple WordPress sites on the same VPS
 - **Discord Monitoring** — Bilingual server health alerts (EN/VI)
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention (single or all sites)
 - **DNS-01 SSL Auto-Renewal** — Cloudflare DNS challenge for seamless cert renewal
-- **PHP Version Choice** — Select PHP 8.3 (stable), 8.4 (stable), or 8.5 (latest) during deployment
 
 ## Quick Start
 
@@ -71,11 +71,27 @@ Automatically detects your server's RAM and CPU, then applies the optimal config
 
 Each profile tunes:
 - Nginx worker connections & buffer sizes
-- PHP-FPM `pm.max_children` & memory limits
-- MariaDB `innodb_buffer_pool_size` (up to 45% of RAM)
+- PHP-FPM `pm.max_children` calculated from actual remaining RAM (after MariaDB + Redis + OS overhead)
+- PHP memory limits and realpath cache
+- MariaDB `innodb_buffer_pool_size` (up to 45% of RAM, with tier caps)
 - Redis `maxmemory` & eviction policies
+- OPcache shared memory, interned strings buffer, and max accelerated files
 
-### 2. Kernel & TCP Stack Tuning
+### 2. OPcache Auto-Tuning by Profile
+
+Since v1.9.0, InitOps automatically configures OPcache according to your hardware profile to prevent cache overflow — a common cause of recompile storms and CPU spikes on heavy WordPress themes:
+
+| Profile | OPcache Memory | Interned Strings | Max Files |
+|---------|---------------|------------------|-----------|
+| `micro` | 96 MB | 16 MB | 30,000 |
+| `small` | 192 MB | 24 MB | 50,000 |
+| `standard` | 256 MB | 32 MB | 65,000 |
+| `medium` | 384 MB | 48 MB | 100,000 |
+| `large` / `xlarge` | 512 MB | 64 MB | 130,000 |
+
+OPcache is configured with `validate_timestamps = 1` and `revalidate_freq = 60` for near-zero stat() overhead in production while still applying theme/plugin updates within 60 seconds.
+
+### 3. Kernel & TCP Stack Tuning
 
 InitOps automatically applies a comprehensive kernel tuning set to maximize network throughput, stabilize connections, and accelerate response times:
 
@@ -87,7 +103,7 @@ InitOps automatically applies a comprehensive kernel tuning set to maximize netw
 
 All configurations are written to `/etc/sysctl.d/99-initops-kernel.conf` and applied immediately via `sysctl --system` — no reboot required.
 
-### 3. Intelligent Swap Management
+### 4. Intelligent Swap Management
 
 InitOps does not create swap rigidly for every profile; instead, it **allocates dynamically based on actual RAM capacity**:
 
@@ -105,7 +121,27 @@ Alongside swap, InitOps tunes two additional critical kernel parameters:
 - `vm.swappiness = 10` — Forces the kernel to prioritize RAM usage, only swapping when RAM is critically low (< 10%).
 - `vm.vfs_cache_pressure = 50` — Keeps inode/dentry cache in RAM longer, accelerating Nginx and log rotation I/O.
 
-### 4. Multi-Site on One VPS
+### 5. PHP Version Manager (New in v1.9.0)
+
+Manage and switch between PHP 8.3, 8.4, and 8.5 **after deployment** without reinstalling the entire stack:
+
+| Capability | Description |
+|------------|-------------|
+| **Install Extra** | Install multiple PHP branches side-by-side — new versions stay inactive (no RAM consumption) until switched |
+| **Zero-Downtime Switch** | Start new PHP-FPM alongside the old one, update all vhosts, validate Nginx, then retire the old FPM |
+| **Instant Rollback** | Old packages remain installed; one menu action reverts everything |
+| **Auto-Reapply Tuning** | Every switch regenerates pool config, runtime INI, and OPcache tuning for the new branch |
+| **PHP CLI Sync** | Automatically updates `update-alternatives` so WP-CLI and cron jobs run on the active version |
+
+**Safe switch workflow:**
+1. Generate InitOps tuning (pool + runtime + OPcache) for the new PHP branch
+2. Validate PHP-FPM config before touching any live service
+3. Start `php[new]-fpm` alongside `php[old]-fpm` (both sockets coexist)
+4. Rewrite `fastcgi_pass` in all vhosts, run `nginx -t`
+5. If `nginx -t` fails → rollback all vhosts immediately, site never goes down
+6. Only after nginx reloads successfully, stop and disable `php[old]-fpm`
+
+### 6. Multi-Site on One VPS
 Deploy multiple independent WordPress sites on the same server:
 
 - Each site gets its own **database**, **Redis DB index**, and **Nginx vhost**
@@ -114,13 +150,15 @@ Deploy multiple independent WordPress sites on the same server:
 - Per-site WP-Cron via `flock` to prevent overlapping processes
 - Backup supports **all sites at once** or **individual selection**
 
-### 5. Security by Default
+### 7. Security by Default
 - **iptables** — Ports 22, 80, 443 only
 - **Fail2Ban** — SSH brute-force protection (5 retries / 1h ban)
+- **MariaDB Hardening** — Removes anonymous users, test database, and disables remote root access
 - **Socket Mode** — MariaDB & Redis communicate via Unix sockets (no TCP exposure)
 - **WP Hardening** — `DISALLOW_FILE_EDIT`, disabled XML-RPC, cron offloaded to system
+- **File Permissions** — Directories 755, files 644, `wp-config.php` 640
 
-### 6. Discord Server Monitor
+### 8. Discord Server Monitor
 Bilingual (English / Vietnamese) webhook alerting for:
 - Disk space critical
 - RAM exhaustion
@@ -130,7 +168,7 @@ Bilingual (English / Vietnamese) webhook alerting for:
 
 Profile-aware cron intervals (every 5–10 minutes).
 
-### 7. One-Shot Domain Migration
+### 9. One-Shot Domain Migration
 Change your domain without breaking anything:
 - Updates Nginx vhost with **config validation before applying**
 - Issues new SSL via Certbot
@@ -138,7 +176,7 @@ Change your domain without breaking anything:
 - Flushes Redis cache automatically
 - **Auto-rollback** if Nginx validation fails
 
-### 8. Database Backups
+### 10. Database Backups
 ```
 /var/backups/wordpress/wp_db_<domain>_<YYYYMMDD_HHMMSS>.sql.gz
 ```
@@ -147,7 +185,7 @@ Change your domain without breaking anything:
 - Auto-cleanup: deletes backups older than 30 days
 - **Multi-site aware** — backup all sites or select individual ones
 
-### 9. DNS-01 SSL Auto-Renewal via Cloudflare
+### 11. DNS-01 SSL Auto-Renewal via Cloudflare
 Migrate an existing cert to DNS challenge renewal — no re-issuance required, no port 80 dependency:
 
 - Installs `python3-certbot-dns-cloudflare` plugin automatically
@@ -167,14 +205,15 @@ Migrate an existing cert to DNS challenge renewal — no re-issuance required, n
 
 Set **Zone Resources** to *Include → Specific zone → your domain* — avoid "All zones" for least-privilege security.
 
-### 10. PHP 8.3, 8.4, or 8.5 — Your Choice
-InitOps v1.8.0 lets you **select your PHP version** during deployment:
+### 12. PHP 8.3, 8.4, or 8.5 — Your Choice
 
-| Version | Status | Best For |
-|---------|--------|----------|
-| **8.3** | Stable, recommended | Production environments, maximum compatibility |
-| **8.4** | Stable | Newer features, improved JIT performance |
-| **8.5** | Latest | Bleeding-edge features, testing the newest technology |
+InitOps v1.9.0 lets you **select your PHP version** during deployment and manage it afterward:
+
+| Version | Status | Active Support | Best For |
+|---------|--------|----------------|----------|
+| **8.3** | Stable | Until Dec 2027 | Security fixes only, maximum compatibility |
+| **8.4** | Stable, recommended | Until Dec 2028 | Production environments, improved JIT |
+| **8.5** | Latest | Until Dec 2029 | Bleeding-edge features, newest technology |
 
 After deployment, the system **auto-detects** your running PHP version when you select **Re-apply Performance Optimizations** — no manual edits needed.
 
@@ -182,7 +221,7 @@ After deployment, the system **auto-detects** your running PHP version when you 
 
 ```
 ============================================================
-                    InitOps v1.8.0
+                    InitOps v1.9.0
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
  [Optimization Profile]: Standard (3.5 – 6 GB | e.g. 4 GB VPS)
@@ -195,9 +234,10 @@ After deployment, the system **auto-detects** your running PHP version when you 
  [6] Server Monitor (Discord Webhook)
  [7] Add New Website
  [8] Configure DNS-01 SSL Auto-Renewal (Cloudflare)
+ [9] PHP Version Manager (Install / Switch 8.3 · 8.4 · 8.5)
  [0] Exit
 ------------------------------------------------------------
-Option (0-8):
+Option (0-9):
 ```
 
 ## Configuration Files
@@ -207,7 +247,8 @@ Option (0-8):
 | Nginx Main | `/etc/nginx/nginx.conf` |
 | Nginx Vhost (default) | `/etc/nginx/sites-available/wordpress` |
 | PHP-FPM Pool | `/etc/php/{8.3,8.4,8.5}/fpm/pool.d/z_custom_pm.conf` |
-| PHP Tuning | `/etc/php/{8.3,8.4,8.5}/fpm/conf.d/99-initops-runtime.ini` |
+| PHP Runtime Tuning | `/etc/php/{8.3,8.4,8.5}/fpm/conf.d/99-initops-runtime.ini` |
+| OPcache Tuning | `/etc/php/{8.3,8.4,8.5}/fpm/conf.d/98-initops-opcache.ini` |
 | MariaDB Tuning | `/etc/mysql/conf.d/z_custom_optimize.cnf` |
 | Redis Config | `/etc/redis/redis.conf` |
 | WP Config (default) | `/var/www/html/wp-config.php` |
@@ -243,6 +284,20 @@ Each new site gets:
 - Dedicated Redis DB index (auto-incremented from DB 1)
 - Custom web root folder under `/var/www/`
 - Isolated Nginx vhost and System Cron
+
+## Switching PHP Versions
+
+Use **Option [9]** in the InitOps menu to manage PHP versions:
+
+```bash
+initops
+# Select [9] PHP Version Manager
+```
+
+Available actions:
+- **Install** additional PHP branches (8.3, 8.4, 8.5) side-by-side
+- **Switch** active PHP version with zero downtime and automatic rollback safety
+- All vhosts are updated automatically, and OPcache tuning is regenerated for the new branch
 
 ## License
 
