@@ -9,7 +9,7 @@ import json
 import urllib.request
 import urllib.error
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -102,42 +102,30 @@ def validate_domain(prompt, default_value="_"):
             return user_input
         print("\033[1;31m[Error]\033[0m Invalid domain format. Use alphanumeric characters, dots, and hyphens only.")
 
-def install_packages(php_ver="8.3"):
-    print(f"\n\033[1;32m[*] Installing LEMP stack (PHP {php_ver}), Certbot & Firewall...\033[0m")
-    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+def _php_package_list(v):
+    """Builds the full apt package string for one PHP branch (8.3/8.4/8.5).
 
-    run_cmd("apt-get update")
-    run_cmd("apt-get install -y software-properties-common curl unzip ghostscript gnupg2 ca-certificates lsb-release")
+    Core PHP packages must exist for every supported branch — if one is
+    missing, something is genuinely wrong (bad PPA/arch).
+    Optional extensions vary by branch on the ondrej/php PPA (e.g.
+    php8.5-opcache no longer exists as a separate .deb because OPcache is
+    compiled into PHP core starting with 8.5 — same idea can hit xmlrpc),
+    so each one is availability-checked individually and a missing package
+    never aborts the whole apt transaction.
 
-    # Bypass interactive prompts for iptables-persistent
-    run_cmd("echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections")
-    run_cmd("echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections")
-
-    run_cmd("add-apt-repository -y ppa:ondrej/php")
-    run_cmd("apt-get update")
-
-    v = php_ver
-
-    # Core packages: must exist for every PHP branch we support (8.3/8.4/8.5).
-    # If any of these is missing, something is genuinely wrong (bad PPA/arch) and we abort.
-    core_packages = (
-        f"nginx mariadb-server redis-server "
+    Shared by the initial deploy (install_packages) and the post-deploy
+    PHP Version Manager.
+    """
+    php_core = (
         f"php{v}-fpm php{v}-mysql php{v}-redis php{v}-bcmath "
         f"php{v}-mbstring php{v}-intl "
         f"php{v}-gd php{v}-imagick "
         f"php{v}-xml "
         f"php{v}-curl "
         f"php{v}-zip php{v}-soap "
-        f"php{v}-exif "
-        f"imagemagick "
-        f"certbot python3-certbot-nginx "
-        f"iptables iptables-persistent"
+        f"php{v}-exif"
     )
 
-    # Optional extensions: package availability varies by PHP branch on the ondrej/php PPA.
-    # e.g. php8.5-opcache no longer exists as a separate .deb because OPcache is compiled
-    # into PHP core starting with 8.5 (always-on by default) — same idea can hit xmlrpc.
-    # We check each one individually so a missing package never aborts the whole apt transaction.
     optional_extensions = [f"php{v}-opcache", f"php{v}-xmlrpc"]
     available_optional = []
     for pkg in optional_extensions:
@@ -156,7 +144,34 @@ def install_packages(php_ver="8.3"):
         else:
             available_optional.append(pkg)
 
-    packages = core_packages + " " + " ".join(available_optional)
+    if available_optional:
+        return php_core + " " + " ".join(available_optional)
+    return php_core
+
+def install_packages(php_ver="8.4"):
+    print(f"\n\033[1;32m[*] Installing LEMP stack (PHP {php_ver}), Certbot & Firewall...\033[0m")
+    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+
+    run_cmd("apt-get update")
+    run_cmd("apt-get install -y software-properties-common curl unzip ghostscript gnupg2 ca-certificates lsb-release")
+
+    # Bypass interactive prompts for iptables-persistent
+    run_cmd("echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections")
+    run_cmd("echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections")
+
+    run_cmd("add-apt-repository -y ppa:ondrej/php")
+    run_cmd("apt-get update")
+
+    v = php_ver
+
+    base_packages = (
+        "nginx mariadb-server redis-server "
+        "imagemagick "
+        "certbot python3-certbot-nginx "
+        "iptables iptables-persistent"
+    )
+
+    packages = base_packages + " " + _php_package_list(v)
 
     if not run_cmd(f"apt-get install -y {packages}", ignore_error=True):
         print(f"\033[1;31m[ERROR]\033[0m Failed to install PHP {v} packages.")
@@ -295,7 +310,164 @@ vm.vfs_cache_pressure = 50
     run_cmd("sysctl --system")
     print("\033[1;32m -> Swap memory optimized (Swappiness set to 10).\033[0m")
 
-def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
+def _write_php_fpm_tuning(profile, ram_mb, cpu_cores, php_ver):
+    """Generates all InitOps PHP drop-ins for one PHP branch:
+      - pool.d/z_custom_pm.conf        (worker sizing from real memory budget)
+      - conf.d/99-initops-runtime.ini  (limits + realpath cache)
+      - conf.d/98-initops-opcache.ini  (OPcache sized per hardware profile)
+
+    Shared by apply_tuning() (deploy / re-optimize) and the PHP Version
+    Manager (switching branches), so a switched-to branch always gets the
+    exact same tuning as a fresh deploy. Returns buffer_pool_mb so MariaDB
+    sizing in apply_tuning() stays in sync with the same budget.
+    """
+    # Fixed per-tier worker counts overcommit RAM on machines at the low end
+    # of a tier (e.g. old "medium" gave 24 workers on an 8 GB box that also
+    # runs a 4 GB buffer pool + 2 GB Redis). Instead, compute how much RAM is
+    # actually left for PHP after OS + MariaDB + Redis + OPcache shm, then
+    # divide by a realistic worker size for a heavy WP theme/plugin stack.
+    #
+    # These maps mirror the EXACT values applied in apply_tuning() sections
+    # 3 (Redis) and 4 (MariaDB), so the services never overcommit RAM
+    # together. If you change a value there, change it here too.
+    REDIS_MB       = {"micro": 128, "small": 384, "standard": 512,
+                      "medium": 2048, "large": 4096, "xlarge": 8192}
+    BP_CAP_MB      = {"micro": 256, "small": 512, "standard": 1536,
+                      "medium": 4096, "large": 7168, "xlarge": 10**9}
+    OS_RESERVED_MB = {"micro": 300, "small": 400, "standard": 512,
+                      "medium": 512, "large": 768, "xlarge": 1024}
+
+    # OPcache shared memory (allocated once, not per worker) — see section 2b.
+    # micro stays at 96M: WP core + a heavy theme compile to well under that,
+    # and the 1 GB tier leans on its 2 GB swap for absolute worst-case peaks.
+    OPC_MEM_MB     = {"micro": 96,  "small": 192, "standard": 256,
+                      "medium": 384, "large": 512, "xlarge": 512}
+
+    buffer_pool_mb = min(int(ram_mb * 0.45), BP_CAP_MB[profile])
+
+    # 1.1x: the buffer pool is not MariaDB's only allocation (per-connection
+    # buffers, dictionary cache, log buffer all live outside it).
+    php_avail_mb = max(
+        256,
+        ram_mb
+        - OS_RESERVED_MB[profile]
+        - int(buffer_pool_mb * 1.1)
+        - REDIS_MB[profile]
+        - OPC_MEM_MB[profile]
+    )
+
+    # Average worker RSS for a heavy WordPress theme/plugin stack.
+    # Real-world values sit around 60–120 MB; 90 is a safe planning figure.
+    AVG_WORKER_MB = 90
+    MC_FLOOR = {"micro": 3,  "small": 5,  "standard": 10,
+                "medium": 12, "large": 24, "xlarge": 48}
+    MC_CAP   = {"micro": 4,  "small": 8,  "standard": 16,
+                "medium": 36, "large": 64, "xlarge": 128}
+
+    max_children  = max(MC_FLOOR[profile],
+                        min(php_avail_mb // AVG_WORKER_MB, MC_CAP[profile]))
+    start_servers = 1 if profile == "micro" else max(2, max_children // 4)
+    min_spare     = start_servers
+    max_spare     = max(start_servers + 1, max_children // 2)
+
+    # Recycle workers more aggressively on RAM-starved tiers (leaky plugins).
+    pm_max_requests = 300 if profile in ("micro", "small") else 500
+
+    fpm_pool_conf = f"/etc/php/{php_ver}/fpm/pool.d/z_custom_pm.conf"
+    fpm_conf = (
+        "[www]\npm = dynamic\n"
+        f"pm.max_children = {max_children}\n"
+        f"pm.start_servers = {start_servers}\n"
+        f"pm.min_spare_servers = {min_spare}\n"
+        f"pm.max_spare_servers = {max_spare}\n"
+        f"pm.max_requests = {pm_max_requests}\n"
+        "pm.process_idle_timeout = 10s\n"
+    )
+    if profile not in ("micro", "small"):
+        # Match the kernel's raised somaxconn — default backlog of 511 can
+        # drop connections during short bursts on busy servers.
+        fpm_conf += "listen.backlog = 1024\n"
+
+    with open(fpm_pool_conf, 'w') as f:
+        f.write(fpm_conf)
+
+    # Named explicitly so it never collides with user-managed opcache config files
+    php_ini_dropin = f"/etc/php/{php_ver}/fpm/conf.d/99-initops-runtime.ini"
+
+    if profile == "micro":
+        mem_limit = "128M"
+    elif profile in ("small", "standard"):
+        mem_limit = "256M"
+    elif profile in ("medium", "large"):
+        mem_limit = "512M"
+    else:  # xlarge
+        mem_limit = "1024M"
+
+    php_tuning = (
+        f"memory_limit = {mem_limit}\n"
+        "post_max_size = 128M\n"
+        "upload_max_filesize = 128M\n"
+        "max_file_uploads = 120\n"
+        "max_execution_time = 120\n"
+        "max_input_time = 120\n"
+        "max_input_vars = 3000\n"
+        "default_socket_timeout = 60\n"
+        "expose_php = Off\n"
+        "; Cache resolved file paths — themes with many includes hammer stat()\n"
+        "; syscalls without this. Cheap RAM, big win for heavy PHP codebases.\n"
+        "realpath_cache_size = 4096k\n"
+        "realpath_cache_ttl = 600\n"
+    )
+
+    with open(php_ini_dropin, 'w') as f:
+        f.write(php_tuning)
+
+    # -------------------------------------------------------------------------
+    # 2b. OPcache — the single most important knob for heavy PHP themes
+    # -------------------------------------------------------------------------
+    # PHP defaults (128 MB shm, 10k files) overflow quickly on a full
+    # WordPress stack (core + heavy theme + plugins easily exceed 10k files).
+    # When OPcache overflows it hard-resets the whole cache repeatedly,
+    # causing recompile storms and CPU spikes under load.
+    opc_mem = OPC_MEM_MB[profile]
+    if profile == "micro":
+        opc_strings, opc_files = 16, 30000
+    elif profile == "small":
+        opc_strings, opc_files = 24, 50000
+    elif profile == "standard":
+        opc_strings, opc_files = 32, 65000
+    elif profile == "medium":
+        opc_strings, opc_files = 48, 100000
+    else:  # large / xlarge
+        opc_strings, opc_files = 64, 130000
+
+    opcache_ini_dropin = f"/etc/php/{php_ver}/fpm/conf.d/98-initops-opcache.ini"
+    opcache_tuning = (
+        "; InitOps OPcache tuning (per hardware profile)\n"
+        "opcache.enable = 1\n"
+        f"opcache.memory_consumption = {opc_mem}\n"
+        f"opcache.interned_strings_buffer = {opc_strings}\n"
+        f"opcache.max_accelerated_files = {opc_files}\n"
+        "opcache.max_wasted_percentage = 10\n"
+        "; Revalidate changed files at most once per minute: near-zero stat()\n"
+        "; overhead in production, while theme/plugin updates still apply\n"
+        "; automatically within 60s (no manual FPM reload needed).\n"
+        "opcache.validate_timestamps = 1\n"
+        "opcache.revalidate_freq = 60\n"
+        "; Some plugins read docblock annotations at runtime — keep comments.\n"
+        "opcache.save_comments = 1\n"
+        "; JIT stays OFF: WordPress-style workloads measure neutral-to-negative\n"
+        "; with JIT while it still costs RAM. Safe default for a public tool.\n"
+        "opcache.jit = off\n"
+        "opcache.jit_buffer_size = 0\n"
+    )
+
+    with open(opcache_ini_dropin, 'w') as f:
+        f.write(opcache_tuning)
+
+    return buffer_pool_mb
+
+def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     print(f"\033[1;32m[*] Applying performance optimizations for: {profile.upper()}...\033[0m")
 
     # -------------------------------------------------------------------------
@@ -310,12 +482,17 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         "include /etc/nginx/modules-enabled/*.conf;\n"
     )
 
+    # fastcgi buffers are sized for heavy pages: WordPress themes with long
+    # archive/list pages easily emit 300 KB – 1 MB of HTML per request. If the
+    # response doesn't fit in fastcgi_buffers, nginx spills it to a temp file
+    # on disk for EVERY request — silent I/O tax. Buffers are allocated
+    # per-connection only as needed, so generous sizes are safe.
     if profile == "micro":
         nginx_events   = "worker_rlimit_nofile 16384;\nevents { worker_connections 1024; use epoll; multi_accept on; }\n"
         nginx_buffers  = (
             "    client_body_buffer_size 64k; client_header_buffer_size 16k;\n"
             "    large_client_header_buffers 4 32k; client_max_body_size 128m;\n"
-            "    fastcgi_buffering on; fastcgi_buffers 4 16k; fastcgi_buffer_size 16k;\n"
+            "    fastcgi_buffering on; fastcgi_buffers 16 16k; fastcgi_buffer_size 32k; fastcgi_busy_buffers_size 64k;\n"
             "    fastcgi_connect_timeout 60; fastcgi_send_timeout 120; fastcgi_read_timeout 120;\n"
         )
         nginx_keepalive   = "    keepalive_timeout 15; keepalive_requests 10000;\n"
@@ -325,7 +502,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         nginx_buffers  = (
             "    client_body_buffer_size 128k; client_header_buffer_size 32k;\n"
             "    large_client_header_buffers 4 64k; client_max_body_size 128m;\n"
-            "    fastcgi_buffering on; fastcgi_buffers 8 16k; fastcgi_buffer_size 16k;\n"
+            "    fastcgi_buffering on; fastcgi_buffers 32 16k; fastcgi_buffer_size 32k; fastcgi_busy_buffers_size 64k;\n"
             "    fastcgi_connect_timeout 60; fastcgi_send_timeout 120; fastcgi_read_timeout 120;\n"
         )
         nginx_keepalive   = "    keepalive_timeout 20; keepalive_requests 20000;\n"
@@ -335,7 +512,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         nginx_buffers  = (
             "    client_body_buffer_size 256k; client_header_buffer_size 64k;\n"
             "    large_client_header_buffers 4 128k; client_max_body_size 128m;\n"
-            "    fastcgi_buffering on; fastcgi_buffers 8 16k; fastcgi_buffer_size 32k;\n"
+            "    fastcgi_buffering on; fastcgi_buffers 32 32k; fastcgi_buffer_size 64k; fastcgi_busy_buffers_size 128k;\n"
             "    fastcgi_connect_timeout 60; fastcgi_send_timeout 120; fastcgi_read_timeout 120;\n"
         )
         nginx_keepalive   = "    keepalive_timeout 25; keepalive_requests 50000;\n"
@@ -345,7 +522,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         nginx_buffers  = (
             "    client_body_buffer_size 256k; client_header_buffer_size 64k;\n"
             "    large_client_header_buffers 4 256k; client_max_body_size 128m;\n"
-            "    fastcgi_buffering on; fastcgi_buffers 16 16k; fastcgi_buffer_size 32k;\n"
+            "    fastcgi_buffering on; fastcgi_buffers 64 32k; fastcgi_buffer_size 64k; fastcgi_busy_buffers_size 256k;\n"
             "    fastcgi_connect_timeout 60; fastcgi_send_timeout 120; fastcgi_read_timeout 120;\n"
         )
         nginx_keepalive   = "    keepalive_timeout 30; keepalive_requests 100000;\n"
@@ -355,7 +532,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         nginx_buffers  = (
             "    client_body_buffer_size 512k; client_header_buffer_size 128k;\n"
             "    large_client_header_buffers 4 512k; client_max_body_size 128m;\n"
-            "    fastcgi_buffering on; fastcgi_buffers 32 16k; fastcgi_buffer_size 64k;\n"
+            "    fastcgi_buffering on; fastcgi_buffers 64 64k; fastcgi_buffer_size 128k; fastcgi_busy_buffers_size 512k;\n"
             "    fastcgi_connect_timeout 60; fastcgi_send_timeout 120; fastcgi_read_timeout 120;\n"
         )
         nginx_keepalive   = "    keepalive_timeout 30; keepalive_requests 200000;\n"
@@ -365,7 +542,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         nginx_buffers  = (
             "    client_body_buffer_size 512k; client_header_buffer_size 128k;\n"
             "    large_client_header_buffers 4 512k; client_max_body_size 128m;\n"
-            "    fastcgi_buffering on; fastcgi_buffers 32 16k; fastcgi_buffer_size 64k;\n"
+            "    fastcgi_buffering on; fastcgi_buffers 64 64k; fastcgi_buffer_size 128k; fastcgi_busy_buffers_size 512k;\n"
             "    fastcgi_connect_timeout 60; fastcgi_send_timeout 120; fastcgi_read_timeout 120;\n"
         )
         nginx_keepalive   = "    keepalive_timeout 30; keepalive_requests 200000;\n"
@@ -398,83 +575,9 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         f.write(nginx_base + nginx_events + nginx_http)
 
     # -------------------------------------------------------------------------
-    # 2. PHP-FPM pool
+    # 2. PHP-FPM pool + runtime ini + OPcache (see _write_php_fpm_tuning)
     # -------------------------------------------------------------------------
-    fpm_pool_conf = f"/etc/php/{php_ver}/fpm/pool.d/z_custom_pm.conf"
-
-    if profile == "micro":
-        fpm_conf = (
-            "[www]\npm = dynamic\n"
-            "pm.max_children = 3\npm.start_servers = 1\n"
-            "pm.min_spare_servers = 1\npm.max_spare_servers = 2\n"
-            "pm.max_requests = 200\npm.process_idle_timeout = 10s\n"
-        )
-    elif profile == "small":
-        fpm_conf = (
-            "[www]\npm = dynamic\n"
-            "pm.max_children = 6\npm.start_servers = 2\n"
-            "pm.min_spare_servers = 2\npm.max_spare_servers = 4\n"
-            "pm.max_requests = 500\npm.process_idle_timeout = 10s\n"
-        )
-    elif profile == "standard":
-        # 4 GB VPS — headroom for OS + MySQL + Redis; ~12 PHP workers fits well
-        fpm_conf = (
-            "[www]\npm = dynamic\n"
-            "pm.max_children = 12\npm.start_servers = 3\n"
-            "pm.min_spare_servers = 3\npm.max_spare_servers = 6\n"
-            "pm.max_requests = 500\npm.process_idle_timeout = 10s\n"
-        )
-    elif profile == "medium":
-        fpm_conf = (
-            "[www]\npm = dynamic\n"
-            "pm.max_children = 24\npm.start_servers = 6\n"
-            "pm.min_spare_servers = 6\npm.max_spare_servers = 12\n"
-            "pm.max_requests = 500\npm.process_idle_timeout = 10s\n"
-        )
-    elif profile == "large":
-        fpm_conf = (
-            "[www]\npm = dynamic\n"
-            "pm.max_children = 48\npm.start_servers = 12\n"
-            "pm.min_spare_servers = 10\npm.max_spare_servers = 24\n"
-            "pm.max_requests = 500\npm.process_idle_timeout = 10s\n"
-        )
-    else:  # xlarge
-        fpm_conf = (
-            "[www]\npm = dynamic\n"
-            "pm.max_children = 96\npm.start_servers = 24\n"
-            "pm.min_spare_servers = 16\npm.max_spare_servers = 48\n"
-            "pm.max_requests = 500\npm.process_idle_timeout = 10s\n"
-        )
-
-    with open(fpm_pool_conf, 'w') as f:
-        f.write(fpm_conf)
-
-    # Named explicitly so it never collides with user-managed opcache config files
-    php_ini_dropin = f"/etc/php/{php_ver}/fpm/conf.d/99-initops-runtime.ini"
-
-    if profile == "micro":
-        mem_limit = "128M"
-    elif profile in ("small", "standard"):
-        mem_limit = "256M"
-    elif profile in ("medium", "large"):
-        mem_limit = "512M"
-    else:  # xlarge
-        mem_limit = "1024M"
-
-    php_tuning = (
-        f"memory_limit = {mem_limit}\n"
-        "post_max_size = 128M\n"
-        "upload_max_filesize = 128M\n"
-        "max_file_uploads = 120\n"
-        "max_execution_time = 120\n"
-        "max_input_time = 120\n"
-        "max_input_vars = 3000\n"
-        "default_socket_timeout = 60\n"
-        "expose_php = Off\n"
-    )
-
-    with open(php_ini_dropin, 'w') as f:
-        f.write(php_tuning)
+    buffer_pool_mb = _write_php_fpm_tuning(profile, ram_mb, cpu_cores, php_ver)
 
     # -------------------------------------------------------------------------
     # 3. Redis
@@ -553,29 +656,30 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
     # -------------------------------------------------------------------------
     # 4. MariaDB
     # -------------------------------------------------------------------------
-    buffer_pool_mb = int(ram_mb * 0.45)
+    # NOTE: buffer_pool_mb is computed once in section 2 (min of 45% RAM and
+    # BP_CAP_MB[profile]) so PHP-FPM sizing and MariaDB always agree on the
+    # same memory budget.
 
     if profile == "micro":
-        buffer_pool_mb   = min(buffer_pool_mb, 256)
         buffer_pool_str  = f"{buffer_pool_mb}M"
         innodb_instances = 1
         innodb_log_size  = "32M";  innodb_log_buf = "8M"
         innodb_io_cap    = 200;    max_conn = 50
         toc = 128;  tdc = 128;  thread_cache = 4
-        tmp_tbl = ""
+        # WP postmeta joins spill to temp tables constantly — even 1 GB boxes
+        # benefit from lifting the 16M default a little.
+        tmp_tbl = "tmp_table_size = 32M\nmax_heap_table_size = 32M\n"
         join_buf = "1M"; sort_buf = "1M"; rnd_buf = "512k"
     elif profile == "small":
-        buffer_pool_mb   = min(buffer_pool_mb, 512)
         buffer_pool_str  = f"{buffer_pool_mb}M"
         innodb_instances = 1
         innodb_log_size  = "64M";  innodb_log_buf = "16M"
         innodb_io_cap    = 400;    max_conn = 100
         toc = 256;  tdc = 256;  thread_cache = 8
-        tmp_tbl = ""
+        tmp_tbl = "tmp_table_size = 48M\nmax_heap_table_size = 48M\n"
         join_buf = "2M"; sort_buf = "2M"; rnd_buf = "1M"
     elif profile == "standard":
-        # ~45% of 4 GB ≈ 1.8 GB — reasonable, leaves plenty for OS + Redis + PHP
-        buffer_pool_mb   = min(buffer_pool_mb, 1536)
+        # ~45% of 4 GB ≈ 1.8 GB, capped 1.5G — leaves room for OS + Redis + PHP
         buffer_pool_str  = f"{buffer_pool_mb}M"
         innodb_instances = 1
         innodb_log_size  = "128M"; innodb_log_buf = "32M"
@@ -584,7 +688,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         tmp_tbl = "tmp_table_size = 64M\nmax_heap_table_size = 64M\n"
         join_buf = "2M"; sort_buf = "2M"; rnd_buf = "1M"
     elif profile == "medium":
-        buffer_pool_mb   = min(buffer_pool_mb, 4096)
         buffer_pool_str  = f"{buffer_pool_mb}M"
         innodb_instances = 2
         innodb_log_size  = "256M"; innodb_log_buf = "64M"
@@ -593,7 +696,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         tmp_tbl = "tmp_table_size = 128M\nmax_heap_table_size = 128M\n"
         join_buf = "2M"; sort_buf = "2M"; rnd_buf = "1M"
     elif profile == "large":
-        bp_gb            = max(1, min(buffer_pool_mb, 7168) // 1024)
+        bp_gb            = max(1, buffer_pool_mb // 1024)
         buffer_pool_str  = f"{bp_gb}G"
         innodb_instances = min(cpu_cores, 8)
         innodb_log_size  = "512M"; innodb_log_buf = "128M"
@@ -634,6 +737,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.3"):
         "innodb_file_per_table = 1\n"
         "innodb_stats_on_metadata = 0\n"
         f"max_connections = {max_conn}\n"
+        "max_allowed_packet = 64M\n"
         f"table_open_cache = {toc}\n"
         f"table_definition_cache = {tdc}\n"
         f"thread_cache_size = {thread_cache}\n"
@@ -740,7 +844,7 @@ def setup_mariadb_secure():
     print("\033[1;32m -> MariaDB: anonymous users removed, remote root disabled, test DB dropped.\033[0m")
 
 
-def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver="8.3"):
+def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver="8.4"):
     print("\n\033[1;32m[*] Deploying WordPress...\033[0m")
 
     wp_path = "/var/www/html"
@@ -897,7 +1001,7 @@ def print_help_menu():
     print(" Plugin Nginx Rules:/var/www/html/nginx.conf")
     print(f" PHP-FPM Pool:      /etc/php/{_pv}/fpm/pool.d/z_custom_pm.conf")
     print(f" PHP INI Tuning:    /etc/php/{_pv}/fpm/conf.d/99-initops-runtime.ini")
-    print(f" OPcache Config:    /etc/php/{_pv}/fpm/conf.d/  (manage separately)")
+    print(f" OPcache Tuning:    /etc/php/{_pv}/fpm/conf.d/98-initops-opcache.ini")
     print(" MariaDB Tuning:    /etc/mysql/conf.d/z_custom_optimize.cnf")
     print(" Redis Config:      /etc/redis/redis.conf")
     print(" WP Config:         /var/www/html/wp-config.php")
@@ -1825,7 +1929,7 @@ def _detect_php_ver():
         if os.path.exists(f"/etc/php/{ver}/fpm/pool.d"):
             return ver
 
-    return "8.3"  # fallback
+    return "8.4"  # fallback (current recommended branch)
 
 
 def add_website():
@@ -2377,6 +2481,263 @@ def setup_cloudflare_ssl():
     input()
 
 
+# =============================================================================
+# PHP Version Manager — install & switch PHP branches after deploy
+# =============================================================================
+
+SUPPORTED_PHP = ("8.3", "8.4", "8.5")
+
+PHP_BRANCH_NOTES = {
+    "8.3": "security fixes only (EOL Dec 2027)",
+    "8.4": "stable, recommended (active support to Dec 2028)",
+    "8.5": "latest (active support to Dec 2029)",
+}
+
+def _installed_php_versions():
+    """Branches with an FPM install present on this machine."""
+    return [v for v in SUPPORTED_PHP if os.path.exists(f"/etc/php/{v}/fpm")]
+
+def _all_vhost_paths():
+    """Every nginx vhost file that may carry a fastcgi_pass directive.
+
+    Covers the main 'wordpress' vhost and every site created via
+    add_website(). sites-enabled entries are symlinks into
+    sites-available, so editing sites-available covers both.
+    """
+    paths = []
+    d = "/etc/nginx/sites-available"
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                paths.append(p)
+    return paths
+
+def _install_php_extra(v):
+    """Installs an additional PHP branch post-deploy. Returns True on success.
+
+    Unlike install_packages() this never sys.exit()s — a failed optional
+    install must not kill an already-running production menu session.
+    """
+    print(f"\n\033[1;32m[*] Installing PHP {v} from ondrej/php PPA...\033[0m")
+    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+
+    run_cmd("add-apt-repository -y ppa:ondrej/php", ignore_error=True)
+    run_cmd("apt-get update")
+
+    pkgs = _php_package_list(v)
+    if not run_cmd(f"apt-get install -y {pkgs}", ignore_error=True):
+        print(f"\033[1;31m[ERROR]\033[0m Failed to install PHP {v} packages.")
+        print(f"       Try 'apt-cache policy php{v}-fpm' to check PPA availability.")
+        return False
+
+    # apt auto-starts the new FPM on its stock config. Park it until the
+    # user actually switches to it, so it doesn't idle-consume RAM.
+    run_cmd(f"systemctl stop php{v}-fpm", ignore_error=True)
+    run_cmd(f"systemctl disable php{v}-fpm", ignore_error=True)
+
+    print(f"\033[1;32m -> PHP {v} installed (inactive until you switch to it).\033[0m")
+    return True
+
+def _switch_php_version(new_ver, old_ver, profile, ram_mb, cpu_cores):
+    """Switches the whole stack from old_ver to new_ver with rollback safety.
+
+    Order of operations is deliberate:
+      1. Regenerate InitOps pool/ini drop-ins for the new branch
+         (fresh apply of current hardware profile — not a blind file copy).
+      2. Validate the new FPM config BEFORE touching anything live.
+      3. Start the new FPM alongside the old one (both sockets up).
+      4. Rewrite fastcgi_pass in every vhost, keeping in-memory backups.
+      5. nginx -t: on failure, restore every vhost byte-for-byte and abort —
+         the site never went down because the old FPM never stopped.
+      6. Only after nginx reloads cleanly: retire the old FPM.
+    Old packages are kept installed so rollback is a single re-switch.
+    """
+    print(f"\n\033[1;34m--- Switching PHP {old_ver} \u2192 {new_ver} ---\033[0m")
+
+    # --- 1. Fresh InitOps tuning files for the new branch -------------------
+    # Generated by the exact same code path as deploy / re-optimize, so a
+    # switched-to branch is never "less tuned" than a fresh install (this
+    # also upgrades pre-1.9.0 deploys that never had the OPcache drop-in).
+    try:
+        _write_php_fpm_tuning(profile, ram_mb, cpu_cores, new_ver)
+        print(f" -> InitOps tuning (pool / runtime / OPcache) generated for PHP {new_ver}.")
+    except Exception as e:
+        print(f"\033[1;31m[ERROR]\033[0m Could not write tuning files for PHP {new_ver}: {e}")
+        print(f" -> Nothing was changed. The server keeps running on PHP {old_ver}.")
+        return False
+
+    # --- 2. Validate new FPM before anything live is touched ----------------
+    check = subprocess.run(
+        f"php-fpm{new_ver} -t", shell=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    if check.returncode != 0:
+        print(f"\033[1;31m[ERROR]\033[0m PHP-FPM {new_ver} config validation failed:")
+        print(check.stderr.decode())
+        print(" -> Nothing was changed. The server keeps running on "
+              f"PHP {old_ver}.")
+        return False
+
+    # --- 3. Start the new FPM alongside the old one -------------------------
+    run_cmd(f"systemctl enable php{new_ver}-fpm", ignore_error=True)
+    run_cmd(f"systemctl restart php{new_ver}-fpm")
+    status = subprocess.run(f"systemctl is-active --quiet php{new_ver}-fpm", shell=True)
+    if status.returncode != 0:
+        print(f"\033[1;31m[ERROR]\033[0m php{new_ver}-fpm failed to start. "
+              f"Check: journalctl -u php{new_ver}-fpm")
+        print(f" -> The server keeps running on PHP {old_ver}. Nothing else was changed.")
+        return False
+    if not os.path.exists(f"/run/php/php{new_ver}-fpm.sock"):
+        print(f"\033[1;31m[ERROR]\033[0m Socket /run/php/php{new_ver}-fpm.sock did not appear.")
+        run_cmd(f"systemctl stop php{new_ver}-fpm", ignore_error=True)
+        return False
+    print(f" -> php{new_ver}-fpm is up (socket verified).")
+
+    # --- 4. Point every vhost at the new socket ------------------------------
+    sock_re = re.compile(r"php\d+\.\d+-fpm\.sock")
+    backups = {}
+    changed_files = 0
+    for path in _all_vhost_paths():
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+        except Exception:
+            continue
+        if "-fpm.sock" not in content:
+            continue
+        new_content = sock_re.sub(f"php{new_ver}-fpm.sock", content)
+        if new_content != content:
+            backups[path] = content
+            try:
+                with open(path, 'w') as f:
+                    f.write(new_content)
+                changed_files += 1
+            except Exception as e:
+                print(f"\033[1;33m[WARNING]\033[0m Could not update {path}: {e}")
+    print(f" -> Updated fastcgi_pass in {changed_files} vhost file(s).")
+
+    # --- 5. Validate nginx; full rollback on failure -------------------------
+    nginx_check = subprocess.run(
+        "nginx -t", shell=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    if nginx_check.returncode != 0:
+        print("\033[1;31m[ERROR]\033[0m nginx -t failed after the vhost update:")
+        print(nginx_check.stderr.decode())
+        print(" -> Rolling back all vhost files...")
+        for path, content in backups.items():
+            try:
+                with open(path, 'w') as f:
+                    f.write(content)
+            except Exception as e:
+                print(f"\033[1;31m[ERROR]\033[0m Rollback failed for {path}: {e}")
+        run_cmd(f"systemctl stop php{new_ver}-fpm", ignore_error=True)
+        run_cmd(f"systemctl disable php{new_ver}-fpm", ignore_error=True)
+        print(f" -> Rolled back. The server keeps running on PHP {old_ver}.")
+        return False
+
+    run_cmd("systemctl reload nginx")
+
+    # --- 6. Retire the old FPM (packages stay installed for easy rollback) ---
+    if old_ver != new_ver:
+        run_cmd(f"systemctl stop php{old_ver}-fpm", ignore_error=True)
+        run_cmd(f"systemctl disable php{old_ver}-fpm", ignore_error=True)
+
+    # CLI binary follows the switch too — WP-Cron (crontab) and wp-cli shell
+    # usage otherwise keep running the old branch silently.
+    run_cmd(f"update-alternatives --set php /usr/bin/php{new_ver}", ignore_error=True)
+
+    # --- 7. Persist so _detect_php_ver() / re-optimize follow along ----------
+    try:
+        with open(LOCK_FILE, 'r') as f:
+            lock_data = json.load(f)
+    except Exception:
+        lock_data = {"deployed": True, "version": VERSION}
+    lock_data["php_ver"] = new_ver
+    lock_data["php_switched_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOCK_FILE, 'w') as f:
+        json.dump(lock_data, f, indent=2)
+    os.chmod(LOCK_FILE, 0o600)
+
+    print(f"\n\033[1;32m -> Switch complete: the stack now runs on PHP {new_ver}.\033[0m")
+    print(f"    PHP {old_ver} packages remain installed — switching back takes one menu action.")
+    return True
+
+def php_version_manager():
+    """Menu [9]: view / install / switch PHP branches post-deploy."""
+    while True:
+        cpu_cores, ram_mb, profile, profile_txt = get_system_resources()
+        active = _detect_php_ver()
+        installed = _installed_php_versions()
+
+        os.system('clear')
+        print("\033[1;36m" + "=" * 60)
+        print("                  PHP Version Manager")
+        print("=" * 60 + "\033[0m")
+        for v in SUPPORTED_PHP:
+            if v == active:
+                mark = "\033[1;32mACTIVE\033[0m   "
+            elif v in installed:
+                mark = "\033[1;33minstalled\033[0m"
+            else:
+                mark = "\033[1;30m-        \033[0m"
+            print(f"  PHP {v}   [{mark}]  {PHP_BRANCH_NOTES[v]}")
+        print("-" * 60)
+        print(" [1] Install another PHP version")
+        print(" [2] Switch active PHP version")
+        print(" [0] Back to main menu")
+        print("-" * 60)
+
+        choice = input("Option (0-2): ").strip()
+
+        if choice == "1":
+            candidates = [v for v in SUPPORTED_PHP if v not in installed]
+            if not candidates:
+                print("\nAll supported PHP versions are already installed.")
+                input("Press Enter to continue...")
+                continue
+            print("\nAvailable to install: " + ", ".join(candidates))
+            target = input("-> Version to install (e.g. 8.5): ").strip()
+            if target not in candidates:
+                print("\033[1;31m[Error]\033[0m Not a valid / not an uninstalled version.")
+                input("Press Enter to continue...")
+                continue
+            _install_php_extra(target)
+            input("\nPress Enter to continue...")
+
+        elif choice == "2":
+            candidates = [v for v in installed if v != active]
+            if not candidates:
+                print("\nNo other installed PHP version to switch to.")
+                print("Install one first with option [1].")
+                input("Press Enter to continue...")
+                continue
+            print(f"\nCurrently active: PHP {active}")
+            print("Switchable to:    " + ", ".join(candidates))
+            target = input("-> Switch to version (e.g. 8.4): ").strip()
+            if target not in candidates:
+                print("\033[1;31m[Error]\033[0m Not a valid installed version.")
+                input("Press Enter to continue...")
+                continue
+            print("\nThis will:")
+            print(f"  1. Carry InitOps tuning (pool / ini / OPcache) to PHP {target}")
+            print(f"  2. Start php{target}-fpm alongside php{active}-fpm (no downtime)")
+            print(f"  3. Repoint every website's fastcgi_pass, validate, reload nginx")
+            print(f"  4. Stop php{active}-fpm (packages kept for instant rollback)")
+            confirm = input("Proceed? [y/N]: ").strip().lower()
+            if confirm == "y":
+                _switch_php_version(target, active, profile, ram_mb, cpu_cores)
+            else:
+                print("Cancelled.")
+            input("\nPress Enter to continue...")
+
+        elif choice == "0":
+            return
+        else:
+            print("Invalid selection.")
+            input("Press Enter to continue...")
+
 def main():
     check_os()
     sys.stdin = open('/dev/tty', 'r')
@@ -2432,10 +2793,15 @@ def main():
         else:
             print(" \033[1;30m[8] Configure DNS-01 SSL Auto-Renewal (Deploy first)\033[0m")
 
+        if is_deployed:
+            print(" [9] PHP Version Manager (Install / Switch 8.3 \u00b7 8.4 \u00b7 8.5)")
+        else:
+            print(" \033[1;30m[9] PHP Version Manager (Deploy first)\033[0m")
+
         print(" [0] Exit")
         print("-" * 60)
 
-        choice = input("Option (0-8): ").strip()
+        choice = input("Option (0-9): ").strip()
 
         if choice == "1":
             if is_deployed:
@@ -2450,14 +2816,14 @@ def main():
             # PHP version selection
             while True:
                 print(" PHP Version:")
-                print("   [1] PHP 8.3 (stable, recommended)")
-                print("   [2] PHP 8.4 (stable)")
+                print("   [1] PHP 8.3 (security fixes only, EOL Dec 2027)")
+                print("   [2] PHP 8.4 (stable, recommended)")
                 print("   [3] PHP 8.5 (latest)")
-                php_choice = input("-> Select PHP version [Default: 1]: ").strip()
-                if php_choice in ("", "1"):
+                php_choice = input("-> Select PHP version [Default: 2]: ").strip()
+                if php_choice == "1":
                     php_ver = "8.3"
                     break
-                elif php_choice == "2":
+                elif php_choice in ("", "2"):
                     php_ver = "8.4"
                     break
                 elif php_choice == "3":
@@ -2579,6 +2945,14 @@ def main():
                 input()
                 continue
             setup_cloudflare_ssl()
+
+        elif choice == "9":
+            if not is_deployed:
+                print("\n\033[1;33m[WARNING]\033[0m Base stack not deployed yet. Please run Option 1 first.")
+                print("Press Enter to continue...")
+                input()
+                continue
+            php_version_manager()
 
         elif choice == "0":
             print("Exiting.")
