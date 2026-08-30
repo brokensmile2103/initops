@@ -25,7 +25,7 @@ PULSE_CPU_THRESHOLD  = 90   # % per-core load avg (1m)
 
 # Same source install.sh fetches from, so `initops update` always pulls
 # from the one canonical location.
-INITOPS_INSTALL_URL = "https://inithtml.com/initops/setup.py"
+INITOPS_INSTALL_URL = "https://raw.githubusercontent.com/brokensmile2103/initops/main/setup.py"
 INITOPS_BIN_PATH     = "/usr/local/bin/initops"
 
 if os.geteuid() != 0:
