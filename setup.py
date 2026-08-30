@@ -583,75 +583,124 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     # 3. Redis
     # -------------------------------------------------------------------------
     redis_conf_path = "/etc/redis/redis.conf"
-    if os.path.exists(redis_conf_path):
-        with open(redis_conf_path, 'r') as f:
-            r = f.read()
 
-        r = r.replace("# unixsocket /run/redis/redis-server.sock", "unixsocket /var/run/redis/redis.sock")
-        r = r.replace("# unixsocketperm 700", "unixsocketperm 770")
+    # Previously this whole section was gated behind `if os.path.exists(...)`,
+    # which meant a missing/relocated file caused every Redis directive
+    # (including tcp-backlog/timeout/maxmemory/etc.) to be silently skipped
+    # on that run — no warning, no error, script just moved on to MariaDB.
+    # Redis tuning is not optional: self-heal once, then hard-fail loudly
+    # rather than silently proceeding with a half-tuned (or untuned) instance.
+    if not os.path.exists(redis_conf_path):
+        print("\033[1;33m[WARN]\033[0m /etc/redis/redis.conf missing — "
+              "reinstalling redis-server to restore it...")
+        run_cmd("apt-get install --reinstall -y redis-server", ignore_error=True)
 
-        r = re.sub(r'^save\s+\d+\s+\d+', '# save ""', r, flags=re.MULTILINE)
-        r = re.sub(r'^save\s+""', 'save ""', r, flags=re.MULTILINE)
-        r = re.sub(r'^(dbfilename\s+dump\.rdb)', '# \\1', r, flags=re.MULTILINE)
-        r = re.sub(r'^appendonly\s+yes', 'appendonly no', r, flags=re.MULTILINE)
+    if not os.path.exists(redis_conf_path):
+        print("\033[1;31m[ERROR]\033[0m /etc/redis/redis.conf still missing after "
+              "reinstall attempt. Redis tuning CANNOT be applied — aborting instead "
+              "of silently continuing.")
+        sys.exit(1)
 
-        r = re.sub(r'\n# --- InitOps tuning ---\n.*', '', r, flags=re.DOTALL)
+    with open(redis_conf_path, 'r') as f:
+        r = f.read()
 
-        if profile == "micro":
-            redis_extra = (
-                "\n# --- InitOps tuning ---\n"
-                "tcp-backlog 128\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
-                "maxmemory 128mb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 5\n"
-                "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
-                "activerehashing yes\nhz 10\n"
-            )
-        elif profile == "small":
-            redis_extra = (
-                "\n# --- InitOps tuning ---\n"
-                "tcp-backlog 511\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
-                "maxmemory 384mb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 10\n"
-                "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
-                "activerehashing yes\nhz 15\n"
-            )
-        elif profile == "standard":
-            redis_extra = (
-                "\n# --- InitOps tuning ---\n"
-                "tcp-backlog 511\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
-                "maxmemory 512mb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 10\n"
-                "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
-                "activerehashing yes\nhz 15\n"
-            )
-        elif profile == "medium":
-            redis_extra = (
-                "\n# --- InitOps tuning ---\n"
-                "tcp-backlog 65536\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
-                "maxmemory 2gb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 10\nmaxclients 50000\n"
-                "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
-                "activerehashing yes\nhz 15\n"
-            )
-        elif profile == "large":
-            redis_extra = (
-                "\n# --- InitOps tuning ---\n"
-                "tcp-backlog 65536\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
-                "maxmemory 4gb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 10\nmaxclients 100000\n"
-                "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
-                "activerehashing yes\nhz 15\n"
-            )
-        else:  # xlarge
-            redis_extra = (
-                "\n# --- InitOps tuning ---\n"
-                "tcp-backlog 65536\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
-                "maxmemory 8gb\nmaxmemory-policy allkeys-lru\nmaxmemory-samples 10\nmaxclients 100000\n"
-                "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
-                "activerehashing yes\nhz 15\n"
-            )
+    r = r.replace("# unixsocket /run/redis/redis-server.sock", "unixsocket /var/run/redis/redis.sock")
+    r = r.replace("# unixsocketperm 700", "unixsocketperm 770")
 
-        with open(redis_conf_path, 'w') as f:
-            f.write(r + redis_extra)
+    # Defensive only: neutralizes an ACTIVE save line if the stock file ever
+    # ships with one uncommented. Ubuntu 24.04's redis-server package ships
+    # `save` pre-commented by default, so this regex alone never fires there —
+    # that's exactly why `save ""` is now also written explicitly inside the
+    # InitOps block below (guaranteed last, guaranteed applied, every time).
+    r = re.sub(r'^save\s+\d+\s+\d+.*$', '# save ""', r, flags=re.MULTILINE)
+    r = re.sub(r'^(dbfilename\s+dump\.rdb)', '# \\1', r, flags=re.MULTILINE)
+    r = re.sub(r'^appendonly\s+yes', 'appendonly no', r, flags=re.MULTILINE)
 
-        run_cmd("usermod -aG redis www-data")
-        os.makedirs("/var/run/redis", exist_ok=True)
-        run_cmd("chown redis:redis /var/run/redis && chmod 775 /var/run/redis")
+    # Explicit BEGIN/END markers instead of "everything from the marker to
+    # EOF" — a DOTALL match to end-of-string is fragile: if anything is ever
+    # appended after this block on a future run, the old greedy strip would
+    # silently eat it too. Bounded markers only ever remove exactly our own
+    # block, every single re-apply, full stop.
+    r = re.sub(
+        r'\n# --- InitOps tuning BEGIN ---\n.*?\n# --- InitOps tuning END ---\n?',
+        '', r, flags=re.DOTALL
+    )
+    r = r.rstrip("\n") + "\n"
+
+    _redis_tiers = {
+        "micro":    dict(backlog=128,   maxmemory="128mb", samples=5,  maxclients=None,   hz=10),
+        "small":    dict(backlog=511,   maxmemory="384mb", samples=10, maxclients=None,   hz=15),
+        "standard": dict(backlog=511,   maxmemory="512mb", samples=10, maxclients=None,   hz=15),
+        "medium":   dict(backlog=65536, maxmemory="2gb",   samples=10, maxclients=50000,  hz=15),
+        "large":    dict(backlog=65536, maxmemory="4gb",   samples=10, maxclients=100000, hz=15),
+        "xlarge":   dict(backlog=65536, maxmemory="8gb",   samples=10, maxclients=100000, hz=15),
+    }
+    tier = _redis_tiers.get(profile, _redis_tiers["standard"])
+
+    maxclients_line = f"maxclients {tier['maxclients']}\n" if tier["maxclients"] else ""
+    redis_extra = (
+        "\n# --- InitOps tuning BEGIN ---\n"
+        f"tcp-backlog {tier['backlog']}\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
+        "save \"\"\n"
+        f"maxmemory {tier['maxmemory']}\nmaxmemory-policy allkeys-lru\nmaxmemory-samples {tier['samples']}\n"
+        f"{maxclients_line}"
+        "lazyfree-lazy-eviction yes\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\n"
+        f"activerehashing yes\nhz {tier['hz']}\n"
+        "# --- InitOps tuning END ---\n"
+    )
+
+    with open(redis_conf_path, 'w') as f:
+        f.write(r + redis_extra)
+
+    run_cmd("usermod -aG redis www-data")
+    os.makedirs("/var/run/redis", exist_ok=True)
+    run_cmd("chown redis:redis /var/run/redis && chmod 775 /var/run/redis")
+
+    # Force a restart HERE (don't just trust the later generic service loop,
+    # which only checks the process is alive — not that our directives were
+    # actually loaded) and verify the live value matches what we just wrote.
+    run_cmd("systemctl restart redis-server")
+
+    def _live_config(key):
+        res = subprocess.run(
+            f"redis-cli -s /var/run/redis/redis.sock CONFIG GET {key}",
+            shell=True, capture_output=True, text=True
+        )
+        if res.returncode != 0:
+            return None
+        # redis-cli in raw/piped mode prints exactly "key\nvalue\n" for a
+        # single CONFIG GET. Do NOT .strip() the whole stdout first — an
+        # empty value (e.g. save "") legitimately renders as a blank second
+        # line, and a blind strip() collapses "key\n\n" down to just "key",
+        # making an empty value look identical to the key name itself.
+        lines = res.stdout.split("\n")
+        if len(lines) < 2:
+            return None
+        return lines[1].rstrip("\r")
+
+    live_maxmemory = _live_config("maxmemory")
+    live_save      = _live_config("save")
+
+    if live_maxmemory is None or live_save is None:
+        print("\033[1;31m[ERROR]\033[0m Could not verify live Redis config via "
+              "the unix socket after restart. Redis tuning may not be active — "
+              "check 'systemctl status redis-server' and 'journalctl -u redis-server'.")
+        sys.exit(1)
+    elif live_maxmemory == "0":
+        print(f"\033[1;31m[ERROR]\033[0m Wrote maxmemory {tier['maxmemory']} to "
+              f"{redis_conf_path} but the running instance still reports maxmemory=0 "
+              f"after restart. The config file and the live process are out of sync — "
+              f"aborting instead of reporting false success.")
+        sys.exit(1)
+    elif live_save != "":
+        print(f"\033[1;31m[ERROR]\033[0m Expected RDB snapshotting to be disabled "
+              f"(save \"\") but the running instance still reports save='{live_save}'. "
+              f"Persistence is active when it shouldn't be — aborting instead of "
+              f"reporting false success.")
+        sys.exit(1)
+    else:
+        print(f"\033[1;32m -> Redis tuning applied and verified live "
+              f"(maxmemory={live_maxmemory}, save disabled).\033[0m")
 
     # -------------------------------------------------------------------------
     # 4. MariaDB
