@@ -8,8 +8,12 @@ import datetime
 import json
 import urllib.request
 import urllib.error
+import ast
+import time
+import shutil
+import hashlib
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -18,6 +22,11 @@ PULSE_CRON_D_PATH    = "/etc/cron.d/initops-server-pulse"
 PULSE_DISK_THRESHOLD = 85   # % disk used
 PULSE_RAM_THRESHOLD  = 90   # % RAM used
 PULSE_CPU_THRESHOLD  = 90   # % per-core load avg (1m)
+
+# Same source install.sh fetches from, so `initops update` always pulls
+# from the one canonical location.
+INITOPS_INSTALL_URL = "https://inithtml.com/initops/setup.py"
+INITOPS_BIN_PATH     = "/usr/local/bin/initops"
 
 if os.geteuid() != 0:
     print("\033[1;31m[ERROR]\033[0m Root privileges required.")
@@ -2787,6 +2796,111 @@ def php_version_manager():
             print("Invalid selection.")
             input("Press Enter to continue...")
 
+def cmd_update():
+    """Fetch the latest InitOps engine and replace the installed binary,
+    validating the download before touching anything on disk. Never
+    overwrites a working installation with a bad/partial/corrupted fetch."""
+    print("\033[1;32m[*] Checking for InitOps updates...\033[0m")
+
+    url = f"{INITOPS_INSTALL_URL}?v={int(time.time())}"
+    tmp_dl_path = INITOPS_BIN_PATH + ".download"
+    if os.path.exists(tmp_dl_path):
+        os.remove(tmp_dl_path)
+
+    # Use curl, not urllib — install.sh's curl fetch of this exact same URL
+    # has worked cleanly on every deploy; Python's urllib.request gets a
+    # Cloudflare 403 (most likely its default User-Agent/TLS fingerprint
+    # reads as a bot to Cloudflare's WAF). Match the client that's already
+    # proven to pass rather than trying to out-guess the WAF's rules.
+    curl = subprocess.run(
+        ["curl", "-fsSL", "-H", "Cache-Control: no-cache", url, "-o", tmp_dl_path],
+        capture_output=True, text=True, timeout=30
+    )
+    if curl.returncode != 0 or not os.path.exists(tmp_dl_path):
+        print(f"\033[1;31m[ERROR]\033[0m Failed to download update "
+              f"(curl exit {curl.returncode}): {curl.stderr.strip() or 'no output'}")
+        print("        Current installation left untouched.")
+        if os.path.exists(tmp_dl_path):
+            os.remove(tmp_dl_path)
+        sys.exit(1)
+
+    try:
+        with open(tmp_dl_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        print("\033[1;31m[ERROR]\033[0m Downloaded file is not valid UTF-8 text.")
+        print("        Current installation left untouched.")
+        sys.exit(1)
+    finally:
+        if os.path.exists(tmp_dl_path):
+            os.remove(tmp_dl_path)
+
+    # Normalize line endings the same way install.sh does before it ever
+    # runs the file, so a syntax check here matches what actually executes.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    try:
+        ast.parse(text)
+    except SyntaxError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Downloaded file failed a syntax check: {e}")
+        print("        Current installation left untouched.")
+        sys.exit(1)
+
+    version_match = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not version_match:
+        print("\033[1;31m[ERROR]\033[0m Downloaded file doesn't look like a valid "
+              "InitOps engine (no VERSION marker found).")
+        print("        Current installation left untouched.")
+        sys.exit(1)
+    new_version = version_match.group(1)
+
+    # Compare by content hash, not just the VERSION string. VERSION doesn't
+    # necessarily change on every fix (bugfixes can ship under the same
+    # version number), so two files can share an identical VERSION string
+    # while having genuinely different content — a length check isn't
+    # airtight either, so hash the actual bytes.
+    new_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    try:
+        with open(INITOPS_BIN_PATH, 'r', encoding='utf-8') as f:
+            current_text = f.read()
+        current_hash = hashlib.sha256(current_text.encode("utf-8")).hexdigest()
+    except OSError:
+        current_hash = None
+
+    if new_hash == current_hash:
+        print(f"\033[1;32m -> Already up to date (v{VERSION}).\033[0m")
+        return
+    content_changed_same_version = (new_version == VERSION)
+
+    # Keep exactly one rollback point. Best-effort: a failed backup still
+    # allows the update to proceed, but is reported so it's not silent.
+    try:
+        shutil.copy2(INITOPS_BIN_PATH, INITOPS_BIN_PATH + ".bak")
+    except Exception as e:
+        print(f"\033[1;33m[WARN]\033[0m Could not back up current binary: {e}")
+
+    tmp_path = INITOPS_BIN_PATH + ".new"
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(text)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, INITOPS_BIN_PATH)  # atomic on the same filesystem
+    except OSError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Failed to install the update: {e}")
+        print("        Current installation left untouched.")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        sys.exit(1)
+
+    if content_changed_same_version:
+        print(f"\033[1;32m -> Updated InitOps (v{VERSION}) — content refreshed, "
+              f"version number unchanged.\033[0m")
+    else:
+        print(f"\033[1;32m -> Updated InitOps: v{VERSION} -> v{new_version}\033[0m")
+    print(f"    Previous version backed up to {INITOPS_BIN_PATH}.bak")
+    print("    Run 'initops' again to use the new version.")
+
+
 def main():
     check_os()
     sys.stdin = open('/dev/tty', 'r')
@@ -2848,6 +2962,8 @@ def main():
             print(" \033[1;30m[9] PHP Version Manager (Deploy first)\033[0m")
 
         print(" [0] Exit")
+        print("-" * 60)
+        print(f" Tip: run \033[1;36minitops update\033[0m anytime to check for a newer version.")
         print("-" * 60)
 
         choice = input("Option (0-9): ").strip()
@@ -3012,4 +3128,7 @@ def main():
             input()
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        cmd_update()
+        sys.exit(0)
     main()
