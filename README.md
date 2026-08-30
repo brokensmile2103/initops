@@ -1,4 +1,4 @@
-# InitOps v1.9.0
+# InitOps v1.9.1
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
 >
@@ -44,6 +44,12 @@ After installation, relaunch anytime with:
 
 ```bash
 initops
+```
+
+Update:
+
+```bash
+initops update
 ```
 
 ## Requirements
