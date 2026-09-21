@@ -1,36 +1,46 @@
-# InitOps v1.9.1
+# InitOps v2.0.0
 
-> **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS.**
+> **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS and Ubuntu 26.04 LTS.**
 >
 > Optimized for real-world VPS tiers — from 1 GB micro instances to 32 GB+ dedicated servers.
 
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20%7C%2026.04%20LTS-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Nginx](https://img.shields.io/badge/Nginx-1.24+-009639?logo=nginx&logoColor=white)](https://nginx.org/)
 [![PHP](https://img.shields.io/badge/PHP-8.3%2F8.4%2F8.5-777BB4?logo=php&logoColor=white)](https://www.php.net/)
-[![MariaDB](https://img.shields.io/badge/MariaDB-10.11+-003545?logo=mariadb&logoColor=white)](https://mariadb.org/)
-[![Redis](https://img.shields.io/badge/Redis-7.0+-DC382D?logo=redis&logoColor=white)](https://redis.io/)
+[![MariaDB](https://img.shields.io/badge/MariaDB-10.11%20%7C%2011.8-003545?logo=mariadb&logoColor=white)](https://mariadb.org/)
+[![Redis](https://img.shields.io/badge/Redis-7.0%20%7C%208.0-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## What is InitOps?
 
-**InitOps** is a single-file, interactive Python CLI that turns a fresh Ubuntu 24.04 server into a production-ready WordPress host in minutes.
+**InitOps** is a single-file, interactive Python CLI that turns a fresh Ubuntu 24.04 or 26.04 server into a production-ready WordPress host in minutes.
 
 No Docker. No Ansible. No 500-line bash scripts. Just run one command, answer a few prompts, and get:
 
 - **LEMP Stack** — Nginx, MariaDB, PHP 8.3/8.4/8.5-FPM, Redis
 - **Security Hardening** — iptables firewall, Fail2Ban, socket-only DB/Redis, MariaDB secure installation
 - **Auto-Tuned Performance** — 6 hardware profiles (micro → xlarge) with dynamic PHP-FPM sizing and OPcache auto-tuning
-- **PHP Version Manager** — Install, switch, and rollback between PHP 8.3/8.4/8.5 post-deployment with zero downtime
+- **PHP Version Manager** — Install, switch, and rollback between PHP branches post-deployment with zero downtime
 - **Multi-Site Support** — Deploy multiple WordPress sites on the same VPS
 - **Discord Monitoring** — Bilingual server health alerts (EN/VI)
 - **Domain Migration** — One-shot domain change + SSL + DB search-replace
 - **Smart Backups** — WP-CLI exports with gzip + 30-day retention (single or all sites)
 - **DNS-01 SSL Auto-Renewal** — Cloudflare DNS challenge for seamless cert renewal
 
+## What's New in v2.0.0
+
+- **Ubuntu 26.04 LTS support** — PHP 8.5 is installed straight from Ubuntu's official repositories, no PPA required. Ubuntu 24.04 works exactly as before.
+- **Automatic OS detection** — Runs only on Ubuntu 24.04 and 26.04; anything else stops immediately (both in `install.sh` and in the engine). After an in-place OS upgrade, the menu shows a warning so you can re-apply the configuration.
+- **OS-aware Fail2Ban** — iptables on 24.04, nftables + systemd journal on 26.04, followed by a check that the `sshd` jail actually started.
+- **MariaDB 11.8 & Redis 8 compatibility** — Removes the deprecated `innodb_buffer_pool_instances`, uses the `mariadb` client, shrinks the unused MyISAM/Aria caches on small tiers, and moves the slow log to `/var/log/mysql` so logrotate covers it.
+- **Easier debugging** — PHP-FPM `catch_workers_output` is enabled so PHP errors reach the log instead of vanishing on a 500, and `request_terminate_timeout = 150s` reclaims stuck workers.
+- **More resilient deployment** — Waits for the dpkg lock on freshly provisioned VPS, enables the `universe` repository if missing, installs `cron` explicitly, and falls back to the wordpress.org tarball if WP-CLI cannot download WordPress.
+- **Accurate PHP support dates** — Active vs. security-only support is now shown correctly for every branch.
+
 ## Quick Start
 
 ```bash
-# Run as root on a fresh Ubuntu 24.04 LTS server
+# Run as root on a fresh Ubuntu 24.04 or 26.04 LTS server
 curl -fsSL https://raw.githubusercontent.com/brokensmile2103/initops/main/install.sh | bash
 ```
 
@@ -56,10 +66,22 @@ initops update
 
 | Requirement | Details |
 |-------------|---------|
-| **OS** | Ubuntu 24.04 LTS (Noble Numbat) |
+| **OS** | Ubuntu 24.04 LTS (Noble Numbat) or Ubuntu 26.04 LTS (Resolute Raccoon) |
 | **Privileges** | Root (`sudo` or `root` user) |
 | **Network** | Internet access for package installation |
 | **RAM** | 1 GB minimum (2 GB+ recommended) |
+
+### Supported Operating Systems
+
+| | Ubuntu 24.04 LTS | Ubuntu 26.04 LTS |
+|---|---|---|
+| **PHP source** | `ppa:ondrej/php` | Ubuntu's own repositories (no PPA) |
+| **PHP versions offered** | 8.3, 8.4 (default), 8.5 | 8.5 only (selected automatically) |
+| **MariaDB** | 10.11 | 11.8 |
+| **Redis** | 7.0 | 8.0 |
+| **Fail2Ban backend** | iptables | nftables + systemd journal |
+
+Other operating systems (including Debian, Linux Mint and non-LTS Ubuntu releases) are not supported and the installer stops immediately.
 
 ## Features
 
@@ -85,7 +107,7 @@ Each profile tunes:
 
 ### 2. OPcache Auto-Tuning by Profile
 
-Since v1.9.0, InitOps automatically configures OPcache according to your hardware profile to prevent cache overflow — a common cause of recompile storms and CPU spikes on heavy WordPress themes:
+InitOps automatically configures OPcache according to your hardware profile to prevent cache overflow — a common cause of recompile storms and CPU spikes on heavy WordPress themes:
 
 | Profile | OPcache Memory | Interned Strings | Max Files |
 |---------|---------------|------------------|-----------|
@@ -127,9 +149,9 @@ Alongside swap, InitOps tunes two additional critical kernel parameters:
 - `vm.swappiness = 10` — Forces the kernel to prioritize RAM usage, only swapping when RAM is critically low (< 10%).
 - `vm.vfs_cache_pressure = 50` — Keeps inode/dentry cache in RAM longer, accelerating Nginx and log rotation I/O.
 
-### 5. PHP Version Manager (New in v1.9.0)
+### 5. PHP Version Manager
 
-Manage and switch between PHP 8.3, 8.4, and 8.5 **after deployment** without reinstalling the entire stack:
+Manage and switch between PHP branches **after deployment** without reinstalling the entire stack:
 
 | Capability | Description |
 |------------|-------------|
@@ -138,6 +160,8 @@ Manage and switch between PHP 8.3, 8.4, and 8.5 **after deployment** without rei
 | **Instant Rollback** | Old packages remain installed; one menu action reverts everything |
 | **Auto-Reapply Tuning** | Every switch regenerates pool config, runtime INI, and OPcache tuning for the new branch |
 | **PHP CLI Sync** | Automatically updates `update-alternatives` so WP-CLI and cron jobs run on the active version |
+
+On **Ubuntu 26.04** only PHP 8.5 is offered (Ubuntu's official repository). If a server was upgraded from 24.04 and still runs an older PHP branch from the PPA, InitOps keeps detecting it correctly, and you can install PHP 8.5 and switch to it with the workflow below.
 
 **Safe switch workflow:**
 1. Generate InitOps tuning (pool + runtime + OPcache) for the new PHP branch
@@ -158,7 +182,7 @@ Deploy multiple independent WordPress sites on the same server:
 
 ### 7. Security by Default
 - **iptables** — Ports 22, 80, 443 only
-- **Fail2Ban** — SSH brute-force protection (5 retries / 1h ban)
+- **Fail2Ban** — SSH brute-force protection (5 retries / 1h ban), iptables action on 24.04, nftables action on 26.04
 - **MariaDB Hardening** — Removes anonymous users, test database, and disables remote root access
 - **Socket Mode** — MariaDB & Redis communicate via Unix sockets (no TCP exposure)
 - **WP Hardening** — `DISALLOW_FILE_EDIT`, disabled XML-RPC, cron offloaded to system
@@ -213,13 +237,13 @@ Set **Zone Resources** to *Include → Specific zone → your domain* — avoid 
 
 ### 12. PHP 8.3, 8.4, or 8.5 — Your Choice
 
-InitOps v1.9.0 lets you **select your PHP version** during deployment and manage it afterward:
+InitOps lets you **select your PHP version** during deployment (Ubuntu 24.04) and manage it afterward. On Ubuntu 26.04, PHP 8.5 is selected automatically.
 
-| Version | Status | Active Support | Best For |
-|---------|--------|----------------|----------|
-| **8.3** | Stable | Until Dec 2027 | Security fixes only, maximum compatibility |
-| **8.4** | Stable, recommended | Until Dec 2028 | Production environments, improved JIT |
-| **8.5** | Latest | Until Dec 2029 | Bleeding-edge features, newest technology |
+| Version | Status | Support | Best For |
+|---------|--------|---------|----------|
+| **8.3** | Security fixes only | Security until Dec 2027 | Maximum compatibility |
+| **8.4** | Stable, default on 24.04 | Active until Dec 2026, security until Dec 2028 | Production environments, improved JIT |
+| **8.5** | Latest, only option on 26.04 | Active until Dec 2027, security until Dec 2029 | Newest features, longest support runway |
 
 After deployment, the system **auto-detects** your running PHP version when you select **Re-apply Performance Optimizations** — no manual edits needed.
 
@@ -227,9 +251,10 @@ After deployment, the system **auto-detects** your running PHP version when you 
 
 ```
 ============================================================
-                    InitOps v1.9.0
+                    InitOps v2.0.0
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
+ [OS]:                  Ubuntu 26.04 LTS
  [Optimization Profile]: Standard (3.5 – 6 GB | e.g. 4 GB VPS)
 ------------------------------------------------------------
  [1] Deploy LEMP Stack & WordPress
@@ -240,11 +265,13 @@ After deployment, the system **auto-detects** your running PHP version when you 
  [6] Server Monitor (Discord Webhook)
  [7] Add New Website
  [8] Configure DNS-01 SSL Auto-Renewal (Cloudflare)
- [9] PHP Version Manager (Install / Switch 8.3 · 8.4 · 8.5)
+ [9] PHP Version Manager (PHP 8.5 from Ubuntu repositories)
  [0] Exit
 ------------------------------------------------------------
 Option (0-9):
 ```
+
+On Ubuntu 24.04, option `[9]` reads `PHP Version Manager (Install / Switch 8.3 · 8.4 · 8.5)`.
 
 ## Configuration Files
 
@@ -255,9 +282,13 @@ Option (0-9):
 | PHP-FPM Pool | `/etc/php/{8.3,8.4,8.5}/fpm/pool.d/z_custom_pm.conf` |
 | PHP Runtime Tuning | `/etc/php/{8.3,8.4,8.5}/fpm/conf.d/99-initops-runtime.ini` |
 | OPcache Tuning | `/etc/php/{8.3,8.4,8.5}/fpm/conf.d/98-initops-opcache.ini` |
+| PHP-FPM Log | `/var/log/php{8.3,8.4,8.5}-fpm.log` |
 | MariaDB Tuning | `/etc/mysql/conf.d/z_custom_optimize.cnf` |
+| MariaDB Slow Log | `/var/log/mysql/mariadb-slow.log` |
 | Redis Config | `/etc/redis/redis.conf` |
+| Fail2Ban Config | `/etc/fail2ban/jail.local` |
 | WP Config (default) | `/var/www/html/wp-config.php` |
+| Deploy Lock | `/etc/.initops_deployed.lock` |
 | Sites Registry | `/etc/.initops_websites.conf` |
 | Monitor Config | `/etc/.initops_pulse.conf` |
 | Monitor Script | `/usr/local/bin/init-server-pulse.sh` |
@@ -275,6 +306,7 @@ Option (0-9):
 3. **Secure your credentials** — the DB password is shown once during deployment
 4. **Install Redis Object Cache** and enable object caching in WordPress
 5. *(Optional)* Install a page caching plugin such as **W3 Total Cache** if additional page caching, browser caching, or CDN integration is desired
+6. *(Recommended)* Check the security services: `fail2ban-client status sshd`
 
 ## Adding More Sites
 
@@ -301,9 +333,17 @@ initops
 ```
 
 Available actions:
-- **Install** additional PHP branches (8.3, 8.4, 8.5) side-by-side
+- **Install** additional PHP branches side-by-side (8.3, 8.4, 8.5 on Ubuntu 24.04; 8.5 on Ubuntu 26.04)
 - **Switch** active PHP version with zero downtime and automatic rollback safety
 - All vhosts are updated automatically, and OPcache tuning is regenerated for the new branch
+
+## Upgrading from v1.9.x
+
+```bash
+initops update
+```
+
+Updating replaces the engine only. The new tuning (PHP-FPM logging, MariaDB cache sizing, slow-log path) is applied to an existing server when you run **Option [2] Re-apply Performance Optimizations**.
 
 ## License
 
@@ -325,6 +365,7 @@ Pull requests are welcome! For major changes, please open an issue first to disc
 
 ## Acknowledgments
 
-- [Ondřej Surý](https://deb.sury.org/) for the maintained PHP PPA
+- [Ondřej Surý](https://deb.sury.org/) for the maintained PHP PPA (used on Ubuntu 24.04)
+- [Ubuntu](https://ubuntu.com/) for shipping PHP 8.5 natively in 26.04
 - [WordPress](https://wordpress.org/) & [WP-CLI](https://wp-cli.org/) teams
 - The open-source Nginx, MariaDB, and Redis communities
