@@ -13,7 +13,7 @@ import time
 import shutil
 import hashlib
 
-VERSION = "1.9.1"
+VERSION = "2.0.0"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -32,17 +32,111 @@ if os.geteuid() != 0:
     print("\033[1;31m[ERROR]\033[0m Root privileges required.")
     sys.exit(1)
 
-def check_os():
+# =============================================================================
+# OS SUPPORT MATRIX (v2.0.0) — Ubuntu 24.04 LTS (noble) + Ubuntu 26.04 LTS (resolute)
+# =============================================================================
+# php_source:
+#   "ppa"     PHP comes from ppa:ondrej/php. Required on 24.04, whose own repositories
+#             only carry PHP 8.3 — 8.4 / 8.5 need the PPA.
+#   "archive" PHP comes straight from Ubuntu's OWN repositories — no third-party PPA at
+#             all. Ubuntu 26.04 ships PHP 8.5 natively (php8.5-fpm, -mysql, -redis,
+#             -imagick ... are all in the `resolute` archive), so PHP 8.5 is the only
+#             version offered there.
+# f2b_banaction:
+#   Fail2Ban ban backend. 24.04 keeps iptables (unchanged from 1.9.x); 26.04 uses
+#   nftables, which is both Ubuntu's and fail2ban 1.1's own default.
+SUPPORTED_UBUNTU = {
+    "24.04": {
+        "codename": "noble",
+        "php_source": "ppa",
+        "php_versions": ("8.3", "8.4", "8.5"),
+        "default_php": "8.4",
+        "f2b_banaction": "iptables-multiport",
+    },
+    "26.04": {
+        "codename": "resolute",
+        "php_source": "archive",
+        "php_versions": ("8.5",),
+        "default_php": "8.5",
+        "f2b_banaction": "nftables",
+    },
+}
+
+# Every PHP branch InitOps can DETECT on a running server (lock file / sockets / pool
+# dirs). Which of them may be freshly INSTALLED depends on the OS (see above): a server
+# upgraded from 24.04 to 26.04 may still be running PHP 8.4 from the PPA and must keep
+# working, even though 26.04 itself only offers PHP 8.5 for new installs.
+KNOWN_PHP_VERS = ("8.3", "8.4", "8.5")
+
+# Wait up to 5 minutes for the dpkg lock instead of failing at once. On a freshly
+# provisioned VPS, unattended-upgrades / cloud-init often hold the lock for the first
+# minutes, which made a bare `apt-get` die instantly with "Could not get lock".
+APT_GET = "apt-get -o DPkg::Lock::Timeout=300"
+
+
+def _read_os_release():
+    """Parses /etc/os-release into a dict (values unquoted). {} if it can't be read."""
+    data = {}
     try:
         with open('/etc/os-release', 'r') as f:
-            content = f.read()
-        if 'Ubuntu' not in content or '24.04' not in content:
-            print("\033[1;31m[ERROR]\033[0m This script requires Ubuntu 24.04 LTS.")
-            print("       Detected OS is not supported. Aborting.")
-            sys.exit(1)
-    except FileNotFoundError:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                data[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    return data
+
+
+def get_os_info():
+    """Support profile of the running OS (a copy of its SUPPORTED_UBUNTU entry plus
+    'version' and 'pretty'), or None when the OS is not a supported Ubuntu LTS."""
+    data = _read_os_release()
+    if data.get("ID") != "ubuntu":
+        return None
+    profile = SUPPORTED_UBUNTU.get(data.get("VERSION_ID", ""))
+    if profile is None:
+        return None
+    info = dict(profile)
+    info["version"] = data["VERSION_ID"]
+    info["pretty"] = data.get("PRETTY_NAME") or f"Ubuntu {data['VERSION_ID']} LTS"
+    return info
+
+
+def current_os():
+    """OS profile of the running system. Falls back to the 24.04 profile ONLY if called
+    on an unsupported OS — check_os() aborts long before that in every real code path."""
+    return get_os_info() or dict(SUPPORTED_UBUNTU["24.04"], version="24.04", pretty="Ubuntu 24.04 LTS")
+
+
+def supported_php_versions():
+    """PHP branches that may be freshly installed on this OS."""
+    return current_os()["php_versions"]
+
+
+def php_uses_ppa():
+    """True when PHP has to come from ppa:ondrej/php, False when Ubuntu's own repos carry it."""
+    return current_os()["php_source"] == "ppa"
+
+
+def check_os():
+    """Aborts unless running on a supported Ubuntu LTS. Returns its profile (see get_os_info)."""
+    data = _read_os_release()
+    if not data:
         print("\033[1;31m[ERROR]\033[0m Cannot detect OS. /etc/os-release not found.")
         sys.exit(1)
+
+    info = get_os_info()
+    if info is None:
+        detected = data.get("PRETTY_NAME") or data.get("NAME") or "unknown"
+        supported = " / ".join(f"Ubuntu {v} LTS" for v in SUPPORTED_UBUNTU)
+        print(f"\033[1;31m[ERROR]\033[0m Unsupported operating system: {detected}")
+        print(f"       InitOps {VERSION} supports {supported}. Aborting.")
+        sys.exit(1)
+    return info
+
 
 def run_cmd(cmd, ignore_error=False):
     """Executes a system shell process silently."""
@@ -53,6 +147,13 @@ def run_cmd(cmd, ignore_error=False):
         if not ignore_error:
             print(f"\033[1;31m[ERROR]\033[0m Command failed: {cmd}")
         return False
+
+
+def db_cli():
+    """Name of the MariaDB client binary. MariaDB 11.x (Ubuntu 26.04) prints a
+    'Deprecated program name' warning whenever the legacy `mysql` name is used, so prefer
+    `mariadb` (present since 10.5 — i.e. on 24.04 too) and fall back to `mysql`."""
+    return "mariadb" if shutil.which("mariadb") else "mysql"
 
 def get_system_resources():
     """Scans hardware assets and assigns the ideal hardware profile."""
@@ -111,43 +212,60 @@ def validate_domain(prompt, default_value="_"):
             return user_input
         print("\033[1;31m[Error]\033[0m Invalid domain format. Use alphanumeric characters, dots, and hyphens only.")
 
-def _php_package_list(v):
-    """Builds the full apt package string for one PHP branch (8.3/8.4/8.5).
+def _apt_has_candidate(pkg):
+    """True when apt knows an INSTALLABLE candidate for `pkg`. Purely virtual package
+    names (e.g. php8.5-exif on Ubuntu 26.04, which php8.5-common provides) return False."""
+    check = subprocess.run(
+        f"apt-cache policy {pkg}", shell=True,
+        capture_output=True, text=True
+    )
+    return (
+        check.returncode == 0
+        and "Candidate:" in check.stdout
+        and "Candidate: (none)" not in check.stdout
+    )
 
-    Core PHP packages must exist for every supported branch — if one is
-    missing, something is genuinely wrong (bad PPA/arch).
-    Optional extensions vary by branch on the ondrej/php PPA (e.g.
-    php8.5-opcache no longer exists as a separate .deb because OPcache is
-    compiled into PHP core starting with 8.5 — same idea can hit xmlrpc),
-    so each one is availability-checked individually and a missing package
-    never aborts the whole apt transaction.
+def _php_package_list(v):
+    """Builds the full apt package string for one PHP branch.
+
+    Two package sources (see SUPPORTED_UBUNTU):
+
+    * ppa (Ubuntu 24.04, ondrej/php, PHP 8.3 / 8.4 / 8.5) — the same package set as
+      InitOps 1.9.x (plus an explicit php-cli). Optional extensions vary by branch on
+      the PPA (e.g. php8.5-opcache no longer exists as a separate .deb because OPcache
+      is compiled into PHP core starting with 8.5 — same idea can hit xmlrpc), so each
+      optional one is availability-checked individually and a missing package never
+      aborts the whole apt transaction.
+
+    * archive (Ubuntu 26.04, Ubuntu's own repositories, PHP 8.5 only) — every name below
+      was checked against the `resolute` package index. Differences vs. the PPA list:
+      no php8.5-exif (a virtual package provided by php8.5-common, so exif is always
+      there) and no php8.5-opcache (built into PHP 8.5 core).
+
+    Core PHP packages must exist for every supported branch — if one is missing,
+    something is genuinely wrong (bad PPA / missing `universe` / wrong arch).
 
     Shared by the initial deploy (install_packages) and the post-deploy
     PHP Version Manager.
     """
     php_core = (
-        f"php{v}-fpm php{v}-mysql php{v}-redis php{v}-bcmath "
+        f"php{v}-fpm php{v}-cli php{v}-mysql php{v}-redis php{v}-bcmath "
         f"php{v}-mbstring php{v}-intl "
         f"php{v}-gd php{v}-imagick "
         f"php{v}-xml "
         f"php{v}-curl "
-        f"php{v}-zip php{v}-soap "
-        f"php{v}-exif"
+        f"php{v}-zip php{v}-soap"
     )
 
-    optional_extensions = [f"php{v}-opcache", f"php{v}-xmlrpc"]
+    if php_uses_ppa():
+        php_core += f" php{v}-exif"
+        optional_extensions = [f"php{v}-opcache", f"php{v}-xmlrpc"]
+    else:
+        optional_extensions = [f"php{v}-xmlrpc"]
+
     available_optional = []
     for pkg in optional_extensions:
-        check = subprocess.run(
-            f"apt-cache policy {pkg}", shell=True,
-            capture_output=True, text=True
-        )
-        has_candidate = (
-            check.returncode == 0
-            and "Candidate: (none)" not in check.stdout
-            and "Candidate:" in check.stdout
-        )
-        if not has_candidate:
+        if not _apt_has_candidate(pkg):
             print(f"\033[1;33m -> Skipping {pkg}: not published for PHP {v} "
                   f"(likely built into core already, e.g. OPcache in PHP 8.5+).\033[0m")
         else:
@@ -157,19 +275,51 @@ def _php_package_list(v):
         return php_core + " " + " ".join(available_optional)
     return php_core
 
-def install_packages(php_ver="8.4"):
+def _ensure_universe():
+    """php-fpm, redis-server, fail2ban, certbot, iptables-persistent and imagemagick all
+    live in Ubuntu's `universe` component. Practically every Ubuntu image has it enabled,
+    but minimal / custom images may not — enable it instead of failing later."""
+    if _apt_has_candidate("redis-server"):
+        return
+    print(" -> 'universe' repository component is not enabled; enabling it...")
+    run_cmd("add-apt-repository -y universe", ignore_error=True)
+    run_cmd(f"{APT_GET} update")
+
+def install_packages(php_ver=None):
+    os_info = current_os()
+    if php_ver is None:
+        php_ver = os_info["default_php"]
+    if php_ver not in os_info["php_versions"]:
+        print(f"\033[1;31m[ERROR]\033[0m PHP {php_ver} is not available on {os_info['pretty']}. "
+              f"Supported here: {', '.join(os_info['php_versions'])}.")
+        sys.exit(1)
+
     print(f"\n\033[1;32m[*] Installing LEMP stack (PHP {php_ver}), Certbot & Firewall...\033[0m")
     os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+    os.environ["NEEDRESTART_MODE"] = "a"   # never stop at the needrestart prompt on an unattended install
 
-    run_cmd("apt-get update")
-    run_cmd("apt-get install -y software-properties-common curl unzip ghostscript gnupg2 ca-certificates lsb-release")
+    run_cmd(f"{APT_GET} update")
+    # `cron` is normally preinstalled, but minimal cloud images omit it — WP-Cron and the
+    # Server Monitor both depend on it, so make it explicit.
+    run_cmd(f"{APT_GET} install -y software-properties-common curl unzip ghostscript gnupg2 ca-certificates lsb-release cron")
+    _ensure_universe()
 
     # Bypass interactive prompts for iptables-persistent
     run_cmd("echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections")
     run_cmd("echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections")
 
-    run_cmd("add-apt-repository -y ppa:ondrej/php")
-    run_cmd("apt-get update")
+    if php_uses_ppa():
+        run_cmd("add-apt-repository -y ppa:ondrej/php")
+        run_cmd(f"{APT_GET} update")
+    else:
+        print(f" -> {os_info['pretty']}: PHP {php_ver} comes from Ubuntu's own repositories "
+              f"(no third-party PPA needed).")
+        if not _apt_has_candidate(f"php{php_ver}-fpm"):
+            print(f"\033[1;31m[ERROR]\033[0m php{php_ver}-fpm has no installable candidate in the "
+                  f"Ubuntu repositories.")
+            print("       Check your network / apt sources (the 'universe' component must be enabled):")
+            print(f"       apt-cache policy php{php_ver}-fpm")
+            sys.exit(1)
 
     v = php_ver
 
@@ -182,11 +332,16 @@ def install_packages(php_ver="8.4"):
 
     packages = base_packages + " " + _php_package_list(v)
 
-    if not run_cmd(f"apt-get install -y {packages}", ignore_error=True):
+    if not run_cmd(f"{APT_GET} install -y {packages}", ignore_error=True):
         print(f"\033[1;31m[ERROR]\033[0m Failed to install PHP {v} packages.")
-        print(f"       The ondrej/php PPA may not have fully built all PHP {v} extensions yet")
-        print(f"       for this Ubuntu release/architecture. Try 'apt-cache policy php{v}-fpm'")
-        print(f"       to check package availability, or pick a different PHP version.")
+        if php_uses_ppa():
+            print(f"       The ondrej/php PPA may not have fully built all PHP {v} extensions yet")
+            print(f"       for this Ubuntu release/architecture. Try 'apt-cache policy php{v}-fpm'")
+            print(f"       to check package availability, or pick a different PHP version.")
+        else:
+            print(f"       Ubuntu's repositories could not satisfy the package set for PHP {v}.")
+            print("       Make sure the 'universe' component is enabled and run 'apt-get update'.")
+        print(f"       To see the exact apt error, run:  {APT_GET} install -y {packages}")
         sys.exit(1)
     print("\033[1;32m -> System packages deployed successfully.\033[0m")
 
@@ -200,17 +355,36 @@ def setup_firewall():
     run_cmd("systemctl enable netfilter-persistent")
     print("\033[1;32m -> Firewall ports (22, 80, 443) secured and saved.\033[0m")
 
-def setup_fail2ban():
-    print("\033[1;32m[*] Installing and configuring Fail2Ban...\033[0m")
+def build_fail2ban_conf(os_info=None):
+    """Content of /etc/fail2ban/jail.local for the given OS.
 
-    run_cmd("apt-get install -y fail2ban")
-
-    fail2ban_conf = (
+    24.04 -> byte-for-byte the 1.9.x configuration (iptables action, distro-provided
+             %(sshd_backend)s).
+    26.04 -> nftables action + the systemd/journald backend. Ubuntu 26.04 logs sshd to
+             the journal only (there is no /var/log/auth.log), and fail2ban 1.1.0's
+             Debian defaults (jail.d/defaults-debian.conf) already use exactly these two
+             settings — they are repeated here so this file stays self-contained.
+    """
+    os_info = os_info or current_os()
+    if os_info["f2b_banaction"] == "nftables":
+        return (
+            "[DEFAULT]\n"
+            "bantime = 3600\n"
+            "findtime = 600\n"
+            "maxretry = 5\n"
+            "banaction = nftables\n"
+            "banaction_allports = nftables[type=allports]\n\n"
+            "[sshd]\n"
+            "enabled = true\n"
+            "port = ssh\n"
+            "backend = systemd\n"
+        )
+    return (
         "[DEFAULT]\n"
         "bantime = 3600\n"
         "findtime = 600\n"
         "maxretry = 5\n"
-        "banaction = iptables-multiport\n\n"
+        f"banaction = {os_info['f2b_banaction']}\n\n"
         "[sshd]\n"
         "enabled = true\n"
         "port = ssh\n"
@@ -218,13 +392,37 @@ def setup_fail2ban():
         "backend = %(sshd_backend)s\n"
     )
 
+def setup_fail2ban():
+    print("\033[1;32m[*] Installing and configuring Fail2Ban...\033[0m")
+
+    os_info = current_os()
+    pkgs = "fail2ban"
+    if os_info["f2b_banaction"] == "nftables":
+        pkgs += " nftables"   # the ban action shells out to `nft`
+    run_cmd(f"{APT_GET} install -y {pkgs}")
+
     with open('/etc/fail2ban/jail.local', 'w') as f:
-        f.write(fail2ban_conf)
+        f.write(build_fail2ban_conf(os_info))
 
     run_cmd("systemctl enable fail2ban")
     run_cmd("systemctl restart fail2ban")
 
-    print("\033[1;32m -> Fail2Ban active: SSH brute-force protection enabled.\033[0m")
+    # Jails are started asynchronously after the service is up — poll for a few seconds
+    # before deciding whether the sshd jail really came alive.
+    jail_ok = False
+    for _ in range(10):
+        chk = subprocess.run("fail2ban-client status sshd", shell=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if chk.returncode == 0:
+            jail_ok = True
+            break
+        time.sleep(1)
+
+    if jail_ok:
+        print("\033[1;32m -> Fail2Ban active: SSH brute-force protection enabled.\033[0m")
+    else:
+        print("\033[1;33m[WARNING]\033[0m Fail2Ban is installed, but the 'sshd' jail did not come up.")
+        print("          Check:  journalctl -u fail2ban -n 30   and   fail2ban-client status")
 
 def setup_kernel_tuning():
     print("\033[1;32m[*] Applying OS Network & Kernel Tuning (TCP BBR & Limits)...\033[0m")
@@ -391,6 +589,10 @@ def _write_php_fpm_tuning(profile, ram_mb, cpu_cores, php_ver):
         f"pm.max_spare_servers = {max_spare}\n"
         f"pm.max_requests = {pm_max_requests}\n"
         "pm.process_idle_timeout = 10s\n"
+        "; Kill a worker stuck for > 150s (hung DB/API call) instead of letting it hold RAM\n"
+        "request_terminate_timeout = 150s\n"
+        "; Send PHP fatal errors / stderr to the PHP-FPM log — without this a 500 leaves no trace\n"
+        "catch_workers_output = yes\n"
     )
     if profile not in ("micro", "small"):
         # Match the kernel's raised somaxconn — default backlog of 511 can
@@ -476,8 +678,10 @@ def _write_php_fpm_tuning(profile, ram_mb, cpu_cores, php_ver):
 
     return buffer_pool_mb
 
-def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
+def apply_tuning(profile, ram_mb, cpu_cores, php_ver=None):
     print(f"\033[1;32m[*] Applying performance optimizations for: {profile.upper()}...\033[0m")
+    if php_ver is None:
+        php_ver = _detect_php_ver()
 
     # -------------------------------------------------------------------------
     # 1. Nginx
@@ -602,7 +806,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     if not os.path.exists(redis_conf_path):
         print("\033[1;33m[WARN]\033[0m /etc/redis/redis.conf missing — "
               "reinstalling redis-server to restore it...")
-        run_cmd("apt-get install --reinstall -y redis-server", ignore_error=True)
+        run_cmd(f"{APT_GET} install --reinstall -y redis-server", ignore_error=True)
 
     if not os.path.exists(redis_conf_path):
         print("\033[1;31m[ERROR]\033[0m /etc/redis/redis.conf still missing after "
@@ -636,6 +840,16 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     )
     r = r.rstrip("\n") + "\n"
 
+    # The two replacements above only fire when the stock file still carries the commented
+    # default socket lines (true for Redis 7.0 on 24.04 and Redis 8.0 on 26.04). If a future
+    # package drops/rewords them, enable the socket explicitly inside the InitOps block
+    # instead of silently ending up with no socket (WordPress talks to Redis through it).
+    socket_lines = ""
+    if not re.search(r'^unixsocket\s', r, flags=re.MULTILINE):
+        socket_lines += "unixsocket /var/run/redis/redis.sock\n"
+    if not re.search(r'^unixsocketperm\s', r, flags=re.MULTILINE):
+        socket_lines += "unixsocketperm 770\n"
+
     _redis_tiers = {
         "micro":    dict(backlog=128,   maxmemory="128mb", samples=5,  maxclients=None,   hz=10),
         "small":    dict(backlog=511,   maxmemory="384mb", samples=10, maxclients=None,   hz=15),
@@ -649,6 +863,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     maxclients_line = f"maxclients {tier['maxclients']}\n" if tier["maxclients"] else ""
     redis_extra = (
         "\n# --- InitOps tuning BEGIN ---\n"
+        f"{socket_lines}"
         f"tcp-backlog {tier['backlog']}\ntimeout 300\ntcp-keepalive 300\nloglevel warning\n"
         "save \"\"\n"
         f"maxmemory {tier['maxmemory']}\nmaxmemory-policy allkeys-lru\nmaxmemory-samples {tier['samples']}\n"
@@ -720,7 +935,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
 
     if profile == "micro":
         buffer_pool_str  = f"{buffer_pool_mb}M"
-        innodb_instances = 1
         innodb_log_size  = "32M";  innodb_log_buf = "8M"
         innodb_io_cap    = 200;    max_conn = 50
         toc = 128;  tdc = 128;  thread_cache = 4
@@ -730,7 +944,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
         join_buf = "1M"; sort_buf = "1M"; rnd_buf = "512k"
     elif profile == "small":
         buffer_pool_str  = f"{buffer_pool_mb}M"
-        innodb_instances = 1
         innodb_log_size  = "64M";  innodb_log_buf = "16M"
         innodb_io_cap    = 400;    max_conn = 100
         toc = 256;  tdc = 256;  thread_cache = 8
@@ -739,7 +952,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     elif profile == "standard":
         # ~45% of 4 GB ≈ 1.8 GB, capped 1.5G — leaves room for OS + Redis + PHP
         buffer_pool_str  = f"{buffer_pool_mb}M"
-        innodb_instances = 1
         innodb_log_size  = "128M"; innodb_log_buf = "32M"
         innodb_io_cap    = 600;    max_conn = 150
         toc = 512;  tdc = 512;  thread_cache = 16
@@ -747,7 +959,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
         join_buf = "2M"; sort_buf = "2M"; rnd_buf = "1M"
     elif profile == "medium":
         buffer_pool_str  = f"{buffer_pool_mb}M"
-        innodb_instances = 2
         innodb_log_size  = "256M"; innodb_log_buf = "64M"
         innodb_io_cap    = 800;    max_conn = 300
         toc = 1024; tdc = 1024; thread_cache = 64
@@ -756,7 +967,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     elif profile == "large":
         bp_gb            = max(1, buffer_pool_mb // 1024)
         buffer_pool_str  = f"{bp_gb}G"
-        innodb_instances = min(cpu_cores, 8)
         innodb_log_size  = "512M"; innodb_log_buf = "128M"
         innodb_io_cap    = 1500;   max_conn = 400
         toc = 2048; tdc = 2048; thread_cache = 96
@@ -765,12 +975,24 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     else:  # xlarge
         bp_gb            = max(1, buffer_pool_mb // 1024)
         buffer_pool_str  = f"{bp_gb}G"
-        innodb_instances = min(cpu_cores, 16)
         innodb_log_size  = "1G";   innodb_log_buf = "256M"
         innodb_io_cap    = 2000;   max_conn = 600
         toc = 4096; tdc = 4096; thread_cache = 128
         tmp_tbl = "tmp_table_size = 256M\nmax_heap_table_size = 256M\n"
         join_buf = "2M"; sort_buf = "2M"; rnd_buf = "1M"
+
+    # MariaDB reserves 128M for the MyISAM key cache and 128M for the Aria page cache by
+    # default, although WordPress lives entirely in InnoDB. Shrink both on the small tiers
+    # (Aria also backs on-disk temp tables, so bigger boxes keep its default size).
+    # NOTE: innodb_buffer_pool_instances is intentionally NOT written any more — it has
+    # been deprecated/ignored since MariaDB 10.5 (single buffer pool), so it did nothing on
+    # 24.04 and is only a startup-failure risk on newer releases such as 26.04 (MariaDB 11.8).
+    _key_buf  = {"micro": "8M", "small": "16M", "standard": "16M",
+                 "medium": "32M", "large": "32M", "xlarge": "32M"}
+    _aria_buf = {"micro": "16M", "small": "32M", "standard": "64M"}
+    mem_extra = f"key_buffer_size = {_key_buf[profile]}\n"
+    if profile in _aria_buf:
+        mem_extra += f"aria_pagecache_buffer_size = {_aria_buf[profile]}\n"
 
     mysql_config = (
         "[mysqld]\n"
@@ -783,7 +1005,6 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
         "default_storage_engine = InnoDB\n"
         "performance_schema = OFF\n"
         f"innodb_buffer_pool_size = {buffer_pool_str}\n"
-        f"innodb_buffer_pool_instances = {innodb_instances}\n"
         f"innodb_log_file_size = {innodb_log_size}\n"
         f"innodb_log_buffer_size = {innodb_log_buf}\n"
         "innodb_flush_log_at_trx_commit = 2\n"
@@ -794,7 +1015,8 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
         "innodb_write_io_threads = 4\n"
         "innodb_file_per_table = 1\n"
         "innodb_stats_on_metadata = 0\n"
-        f"max_connections = {max_conn}\n"
+        + mem_extra
+        + f"max_connections = {max_conn}\n"
         "max_allowed_packet = 64M\n"
         f"table_open_cache = {toc}\n"
         f"table_definition_cache = {tdc}\n"
@@ -804,6 +1026,7 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
         f"sort_buffer_size = {sort_buf}\n"
         f"read_rnd_buffer_size = {rnd_buf}\n"
         "slow_query_log = 1\n"
+        "slow_query_log_file = /var/log/mysql/mariadb-slow.log\n"
         "long_query_time = 2\n"
         "log_queries_not_using_indexes = 0\n"
         "skip_log_bin\n"
@@ -813,6 +1036,12 @@ def apply_tuning(profile, ram_mb, cpu_cores, php_ver="8.4"):
     )
 
     os.makedirs("/etc/mysql/conf.d/", exist_ok=True)
+    # The slow log lives in /var/log/mysql so the distro logrotate rule (/var/log/mysql/*.log)
+    # covers it. The package normally creates that directory; if it is missing MariaDB would
+    # refuse to start, so create it (owned like the package would) rather than risk that.
+    if not os.path.isdir("/var/log/mysql"):
+        os.makedirs("/var/log/mysql", exist_ok=True)
+        run_cmd("chown mysql:adm /var/log/mysql", ignore_error=True)
     mysql_custom_path = "/etc/mysql/conf.d/z_custom_optimize.cnf"
     with open(mysql_custom_path, 'w') as f:
         f.write(mysql_config)
@@ -872,7 +1101,7 @@ def setup_mariadb_secure():
 
     # Check if root can still connect passwordlessly (not yet secured)
     check = subprocess.run(
-        ["mysql", "-u", "root", "-e", "SELECT 1;"],
+        [db_cli(), "-u", "root", "-e", "SELECT 1;"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     if check.returncode != 0:
@@ -893,7 +1122,7 @@ def setup_mariadb_secure():
 
     for stmt in secure_statements:
         result = subprocess.run(
-            ["mysql", "-u", "root", "-e", stmt],
+            [db_cli(), "-u", "root", "-e", stmt],
             capture_output=True, text=True
         )
         if result.returncode != 0:
@@ -902,8 +1131,24 @@ def setup_mariadb_secure():
     print("\033[1;32m -> MariaDB: anonymous users removed, remote root disabled, test DB dropped.\033[0m")
 
 
-def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver="8.4"):
+def _download_wordpress_core(wp_path):
+    """Downloads WordPress core into wp_path. wp-cli first (it verifies checksums); if that
+    fails for any reason (GitHub-hosted phar unreachable, a nightly wp-cli build not yet
+    happy with a brand-new PHP release...) fall back to the official wordpress.org tarball,
+    so a deploy is not lost to a tooling hiccup. Returns True when wp-load.php exists.
+    """
+    marker = os.path.join(wp_path, "wp-load.php")
+    run_cmd(f"wp core download --path={wp_path} --allow-root", ignore_error=True)
+    if os.path.exists(marker):
+        return True
+    print("\033[1;33m -> wp-cli could not download WordPress; falling back to the wordpress.org tarball...\033[0m")
+    run_cmd(f"curl -fsSL https://wordpress.org/latest.tar.gz | tar -xz --strip-components=1 -C {wp_path}", ignore_error=True)
+    return os.path.exists(marker)
+
+def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver=None):
     print("\n\033[1;32m[*] Deploying WordPress...\033[0m")
+    if php_ver is None:
+        php_ver = _detect_php_ver()
 
     wp_path = "/var/www/html"
     os.makedirs(wp_path, exist_ok=True)
@@ -911,14 +1156,22 @@ def deploy_wordpress(domain, db_name, db_user, db_prefix, php_ver="8.4"):
 
     run_cmd("curl -sSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp")
     run_cmd("chmod +x /usr/local/bin/wp")
-    run_cmd("wp core download --path=/var/www/html --allow-root")
+    # Fail fast (and clearly) if wp-cli cannot even start — every later step depends on it.
+    if not run_cmd("wp --info --allow-root", ignore_error=True):
+        print("\033[1;31m[ERROR]\033[0m WP-CLI could not start (download failed, or it is not compatible with this PHP version).")
+        print("       Check the server's outbound access to raw.githubusercontent.com and run: wp --info --allow-root")
+        sys.exit(1)
+    if not _download_wordpress_core(wp_path):
+        print("\033[1;31m[ERROR]\033[0m Could not download WordPress core (wp-cli and wordpress.org both failed).")
+        print("       Check the server's outbound network access, then run option [1] again.")
+        sys.exit(1)
 
     db_pass = secrets.token_urlsafe(20)
 
-    run_cmd(f"mysql -u root -e \"CREATE DATABASE IF NOT EXISTS \\`{db_name}\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"")
-    run_cmd(f"mysql -u root -e \"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_pass}';\"")
-    run_cmd(f"mysql -u root -e \"GRANT ALL PRIVILEGES ON \\`{db_name}\\`.* TO '{db_user}'@'localhost';\"")
-    run_cmd("mysql -u root -e \"FLUSH PRIVILEGES;\"")
+    run_cmd(f"{db_cli()} -u root -e \"CREATE DATABASE IF NOT EXISTS \\`{db_name}\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"")
+    run_cmd(f"{db_cli()} -u root -e \"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_pass}';\"")
+    run_cmd(f"{db_cli()} -u root -e \"GRANT ALL PRIVILEGES ON \\`{db_name}\\`.* TO '{db_user}'@'localhost';\"")
+    run_cmd(f"{db_cli()} -u root -e \"FLUSH PRIVILEGES;\"")
 
     run_cmd(
         f"wp config create "
@@ -1061,6 +1314,8 @@ def print_help_menu():
     print(f" PHP INI Tuning:    /etc/php/{_pv}/fpm/conf.d/99-initops-runtime.ini")
     print(f" OPcache Tuning:    /etc/php/{_pv}/fpm/conf.d/98-initops-opcache.ini")
     print(" MariaDB Tuning:    /etc/mysql/conf.d/z_custom_optimize.cnf")
+    print(" MariaDB Slow Log:  /var/log/mysql/mariadb-slow.log")
+    print(f" PHP-FPM Log:       /var/log/php{_pv}-fpm.log")
     print(" Redis Config:      /etc/redis/redis.conf")
     print(" WP Config:         /var/www/html/wp-config.php")
     print(" Fail2Ban Config:   /etc/fail2ban/jail.local")
@@ -1752,10 +2007,15 @@ handle_alert "cpu" \
     "$CPU_ALERT"
 
 # =============================================================================
-# METRIC 4: MySQL / MariaDB — mysqladmin ping (Unix socket, no credentials)
+# METRIC 4: MySQL / MariaDB — mariadb-admin / mysqladmin ping (Unix socket, no credentials)
 # =============================================================================
 MYSQL_ALERT=0
-mysqladmin ping --silent 2>/dev/null || MYSQL_ALERT=1
+# MariaDB 11.x (Ubuntu 26.04) deprecates the mysqladmin name; prefer mariadb-admin when it exists.
+if command -v mariadb-admin >/dev/null 2>&1; then
+    mariadb-admin ping --silent 2>/dev/null || MYSQL_ALERT=1
+else
+    mysqladmin ping --silent 2>/dev/null || MYSQL_ALERT=1
+fi
 
 handle_alert "mysql" \
     "$(t mysql_alert_title)" \
@@ -1962,32 +2222,56 @@ def _get_next_redis_db():
 
 def _detect_php_ver():
     """Detect the active PHP-FPM version installed on the server (8.3, 8.4 or 8.5).
-    Priority: lock file (source of truth) → running socket → installed pool dir → fallback 8.3.
-    """
-    SUPPORTED_PHP_VERS = ("8.3", "8.4", "8.5")
+    Priority: lock file (source of truth) → running socket → installed pool dir → OS default.
 
+    Detection deliberately uses KNOWN_PHP_VERS rather than the per-OS install list: a
+    server upgraded from Ubuntu 24.04 to 26.04 may still be running PHP 8.4 from the PPA
+    and must be recognised as such, even though 26.04 itself only offers PHP 8.5.
+    """
     # 1. Read from lock file (most reliable — written at deploy time)
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, 'r') as f:
                 data = json.load(f)
             ver = data.get("php_ver", "")
-            if ver in SUPPORTED_PHP_VERS:
+            if ver in KNOWN_PHP_VERS:
                 return ver
         except Exception:
             pass  # lock file is old plain-text format or corrupt → fall through
 
     # 2. Check running PHP-FPM socket (server is live)
-    for ver in ("8.5", "8.4", "8.3"):
+    for ver in reversed(KNOWN_PHP_VERS):
         if os.path.exists(f"/run/php/php{ver}-fpm.sock"):
             return ver
 
     # 3. Check installed pool directory (service may be stopped)
-    for ver in ("8.5", "8.4", "8.3"):
+    for ver in reversed(KNOWN_PHP_VERS):
         if os.path.exists(f"/etc/php/{ver}/fpm/pool.d"):
             return ver
 
-    return "8.4"  # fallback (current recommended branch)
+    return current_os()["default_php"]  # fallback: this OS's recommended branch
+
+
+def _read_lock():
+    """Deploy lock file as a dict ({} when missing, unreadable or in the old plain-text format)."""
+    try:
+        with open(LOCK_FILE, 'r') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _update_lock(**fields):
+    """Merge fields into the deploy lock file (no-op when the stack isn't deployed yet)."""
+    if not os.path.exists(LOCK_FILE):
+        return
+    data = _read_lock()
+    data.setdefault("deployed", True)
+    data.update(fields)
+    with open(LOCK_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.chmod(LOCK_FILE, 0o600)
 
 
 def add_website():
@@ -2060,16 +2344,21 @@ def add_website():
     # -------------------------------------------------------------------------
     db_pass = secrets.token_urlsafe(20)
 
-    run_cmd(f"mysql -u root -e \"CREATE DATABASE IF NOT EXISTS \\`{db_name}\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"")
-    run_cmd(f"mysql -u root -e \"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_pass}';\"")
-    run_cmd(f"mysql -u root -e \"GRANT ALL PRIVILEGES ON \\`{db_name}\\`.* TO '{db_user}'@'localhost';\"")
-    run_cmd("mysql -u root -e \"FLUSH PRIVILEGES;\"")
+    run_cmd(f"{db_cli()} -u root -e \"CREATE DATABASE IF NOT EXISTS \\`{db_name}\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"")
+    run_cmd(f"{db_cli()} -u root -e \"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' IDENTIFIED BY '{db_pass}';\"")
+    run_cmd(f"{db_cli()} -u root -e \"GRANT ALL PRIVILEGES ON \\`{db_name}\\`.* TO '{db_user}'@'localhost';\"")
+    run_cmd(f"{db_cli()} -u root -e \"FLUSH PRIVILEGES;\"")
     print("\033[1;32m -> Database created.\033[0m")
 
     # -------------------------------------------------------------------------
     # WordPress core download & wp-config
     # -------------------------------------------------------------------------
-    run_cmd(f"wp core download --path={wp_path} --allow-root")
+    if not _download_wordpress_core(wp_path):
+        print("\033[1;31m[ERROR]\033[0m Could not download WordPress core (wp-cli and wordpress.org both failed).")
+        print("       The database was created but no files were deployed. Check outbound network access and retry.")
+        print("\nPress Enter to return to the main menu...")
+        input()
+        return
 
     run_cmd(
         f"wp config create "
@@ -2358,7 +2647,7 @@ def setup_cloudflare_ssl():
     # Step 3 — Install certbot-dns-cloudflare plugin
     # -------------------------------------------------------------------------
     print("\033[1;34m[Step 3/6] Installing certbot-dns-cloudflare plugin...\033[0m")
-    if not run_cmd("apt-get install -y python3-certbot-dns-cloudflare"):
+    if not run_cmd(f"{APT_GET} install -y python3-certbot-dns-cloudflare"):
         print("\033[1;31m[ERROR]\033[0m Failed to install python3-certbot-dns-cloudflare.")
         print("        Check your internet connection or apt sources.")
         print("Press Enter to return to the main menu...")
@@ -2543,17 +2832,49 @@ def setup_cloudflare_ssl():
 # PHP Version Manager — install & switch PHP branches after deploy
 # =============================================================================
 
-SUPPORTED_PHP = ("8.3", "8.4", "8.5")
-
 PHP_BRANCH_NOTES = {
-    "8.3": "security fixes only (EOL Dec 2027)",
-    "8.4": "stable, recommended (active support to Dec 2028)",
-    "8.5": "latest (active support to Dec 2029)",
+    "8.3": "security fixes only (until Dec 2027)",
+    "8.4": "stable (active support until Dec 2026, security until Dec 2028)",
+    "8.5": "latest (active support until Dec 2027, security until Dec 2029)",
 }
 
 def _installed_php_versions():
-    """Branches with an FPM install present on this machine."""
-    return [v for v in SUPPORTED_PHP if os.path.exists(f"/etc/php/{v}/fpm")]
+    """Branches with an FPM install present on this machine (any known branch — including
+    ones the current OS would no longer offer for a fresh install, e.g. after an OS upgrade)."""
+    return [v for v in KNOWN_PHP_VERS if os.path.exists(f"/etc/php/{v}/fpm")]
+
+def choose_php_version():
+    """Interactive PHP branch picker for the initial deploy. Only offers what the running
+    OS can actually install (see SUPPORTED_UBUNTU): 24.04 → 8.3 / 8.4 / 8.5 from the
+    ondrej PPA; 26.04 → only PHP 8.5, straight from Ubuntu's own repositories."""
+    os_info = current_os()
+    versions = list(os_info["php_versions"])
+    default = os_info["default_php"]
+
+    if len(versions) == 1:
+        only = versions[0]
+        print(f" PHP Version: \033[1;33m{only}\033[0m — {os_info['pretty']} ships PHP {only} in its own "
+              f"repositories (no PPA needed).")
+        print("              It is the only PHP version supported on this Ubuntu release.")
+        print(f"\033[1;32m -> PHP {only} selected.\033[0m\n")
+        return only
+
+    default_idx = versions.index(default) + 1
+    while True:
+        print(" PHP Version:")
+        for i, v in enumerate(versions, 1):
+            mark = "  <- default" if v == default else ""
+            print(f"   [{i}] PHP {v} — {PHP_BRANCH_NOTES[v]}{mark}")
+        raw = input(f"-> Select PHP version [Default: {default_idx}]: ").strip()
+        if raw == "":
+            php_ver = default
+            break
+        if raw.isdigit() and 1 <= int(raw) <= len(versions):
+            php_ver = versions[int(raw) - 1]
+            break
+        print(f"\033[1;31m[Error]\033[0m Please enter a number between 1 and {len(versions)}.")
+    print(f"\033[1;32m -> PHP {php_ver} selected.\033[0m\n")
+    return php_ver
 
 def _all_vhost_paths():
     """Every nginx vhost file that may carry a fastcgi_pass directive.
@@ -2577,16 +2898,26 @@ def _install_php_extra(v):
     Unlike install_packages() this never sys.exit()s — a failed optional
     install must not kill an already-running production menu session.
     """
-    print(f"\n\033[1;32m[*] Installing PHP {v} from ondrej/php PPA...\033[0m")
-    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+    os_info = current_os()
+    if v not in os_info["php_versions"]:
+        print(f"\033[1;31m[ERROR]\033[0m PHP {v} is not available on {os_info['pretty']} "
+              f"(supported here: {', '.join(os_info['php_versions'])}).")
+        return False
 
-    run_cmd("add-apt-repository -y ppa:ondrej/php", ignore_error=True)
-    run_cmd("apt-get update")
+    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+    os.environ["NEEDRESTART_MODE"] = "a"
+
+    if php_uses_ppa():
+        print(f"\n\033[1;32m[*] Installing PHP {v} from ondrej/php PPA...\033[0m")
+        run_cmd("add-apt-repository -y ppa:ondrej/php", ignore_error=True)
+    else:
+        print(f"\n\033[1;32m[*] Installing PHP {v} from Ubuntu's repositories...\033[0m")
+    run_cmd(f"{APT_GET} update")
 
     pkgs = _php_package_list(v)
-    if not run_cmd(f"apt-get install -y {pkgs}", ignore_error=True):
+    if not run_cmd(f"{APT_GET} install -y {pkgs}", ignore_error=True):
         print(f"\033[1;31m[ERROR]\033[0m Failed to install PHP {v} packages.")
-        print(f"       Try 'apt-cache policy php{v}-fpm' to check PPA availability.")
+        print(f"       Try 'apt-cache policy php{v}-fpm' to check package availability.")
         return False
 
     # apt auto-starts the new FPM on its stock config. Park it until the
@@ -2733,7 +3064,13 @@ def php_version_manager():
         print("\033[1;36m" + "=" * 60)
         print("                  PHP Version Manager")
         print("=" * 60 + "\033[0m")
-        for v in SUPPORTED_PHP:
+        os_info = current_os()
+        supported = os_info["php_versions"]
+        src_txt = "ondrej/php PPA" if php_uses_ppa() else "Ubuntu repositories (no PPA)"
+        print(f" {os_info['pretty']}  |  PHP source: {src_txt}")
+        print("-" * 60)
+        shown = [v for v in KNOWN_PHP_VERS if v in supported or v in installed]
+        for v in shown:
             if v == active:
                 mark = "\033[1;32mACTIVE\033[0m   "
             elif v in installed:
@@ -2750,9 +3087,13 @@ def php_version_manager():
         choice = input("Option (0-2): ").strip()
 
         if choice == "1":
-            candidates = [v for v in SUPPORTED_PHP if v not in installed]
+            candidates = [v for v in supported if v not in installed]
             if not candidates:
-                print("\nAll supported PHP versions are already installed.")
+                if len(supported) == 1:
+                    print(f"\nPHP {supported[0]} is the only version available on {os_info['pretty']} "
+                          f"and it is already installed.")
+                else:
+                    print("\nAll supported PHP versions are already installed.")
                 input("Press Enter to continue...")
                 continue
             print("\nAvailable to install: " + ", ".join(candidates))
@@ -2902,7 +3243,7 @@ def cmd_update():
 
 
 def main():
-    check_os()
+    os_info = check_os()
     sys.stdin = open('/dev/tty', 'r')
     while True:
         cpu, ram, profile, profile_txt = get_system_resources()
@@ -2913,7 +3254,13 @@ def main():
         print(f"                    InitOps v{VERSION}                          ")
         print("=" * 60 + "\033[0m")
         print(f" [System]:              {cpu} CPU Cores | {ram} MB RAM")
+        print(f" [OS]:                  {os_info['pretty']}")
         print(f" [Optimization Profile]: \033[1;33m{profile_txt}\033[0m")
+        if is_deployed:
+            deployed_os = _read_lock().get("os_version")
+            if deployed_os and deployed_os != os_info["version"]:
+                print(f" \033[1;33m[!] Deployed on Ubuntu {deployed_os}, now running Ubuntu {os_info['version']}. "
+                      f"Verify your services, then use [2] to re-apply.\033[0m")
         print("-" * 60)
 
         if not is_deployed:
@@ -2957,7 +3304,12 @@ def main():
             print(" \033[1;30m[8] Configure DNS-01 SSL Auto-Renewal (Deploy first)\033[0m")
 
         if is_deployed:
-            print(" [9] PHP Version Manager (Install / Switch 8.3 \u00b7 8.4 \u00b7 8.5)")
+            _sep = " \u00b7 "
+            if len(os_info["php_versions"]) > 1:
+                _pvm_txt = f"Install / Switch {_sep.join(os_info['php_versions'])}"
+            else:
+                _pvm_txt = f"PHP {os_info['php_versions'][0]} from Ubuntu repositories"
+            print(f" [9] PHP Version Manager ({_pvm_txt})")
         else:
             print(" \033[1;30m[9] PHP Version Manager (Deploy first)\033[0m")
 
@@ -2978,25 +3330,8 @@ def main():
 
             print("\n\033[1;34m--- Deployment Configuration ---\033[0m")
 
-            # PHP version selection
-            while True:
-                print(" PHP Version:")
-                print("   [1] PHP 8.3 (security fixes only, EOL Dec 2027)")
-                print("   [2] PHP 8.4 (stable, recommended)")
-                print("   [3] PHP 8.5 (latest)")
-                php_choice = input("-> Select PHP version [Default: 2]: ").strip()
-                if php_choice == "1":
-                    php_ver = "8.3"
-                    break
-                elif php_choice in ("", "2"):
-                    php_ver = "8.4"
-                    break
-                elif php_choice == "3":
-                    php_ver = "8.5"
-                    break
-                else:
-                    print("\033[1;31m[Error]\033[0m Please enter 1, 2 or 3.")
-            print(f"\033[1;32m -> PHP {php_ver} selected.\033[0m\n")
+            # PHP version selection (only what this OS can install — see SUPPORTED_UBUNTU)
+            php_ver = choose_php_version()
 
             domain    = validate_domain("-> Domain name (e.g. site.com) [Default: _]: ")
             db_name   = validate_input("-> Database name   [Default: wp_production]: ", "wp_production")
@@ -3018,6 +3353,7 @@ def main():
                     "deployed": True,
                     "version":  VERSION,
                     "php_ver":  php_ver,
+                    "os_version": os_info["version"],
                     "domain":   domain,
                     "db_name":  db_name,
                     "deployed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3028,6 +3364,7 @@ def main():
             print("              Deployment completed successfully               ")
             print("=" * 60 + "\033[0m")
             print(f" -> Version:           {VERSION}")
+            print(f" -> OS:                {os_info['pretty']}")
             print(f" -> PHP Version:       {php_ver}")
             print(f" -> Web root:          /var/www/html")
             print(f" -> Domain:            {domain if domain != '_' else 'Direct Public IP'}")
@@ -3058,6 +3395,7 @@ def main():
             php_ver = _detect_php_ver()
             print(f" -> PHP version detected: {php_ver}")
             apply_tuning(profile, ram, cpu, php_ver)
+            _update_lock(os_version=os_info["version"])
             print("\nPress Enter to return to the main menu...")
             input()
 
@@ -3080,7 +3418,7 @@ def main():
 
         elif choice == "5":
             if not is_deployed:
-                print("\n\\033[1;33m[WARNING]\\033[0m Base stack not deployed yet. Please run Option 1 first.")
+                print("\n\033[1;33m[WARNING]\033[0m Base stack not deployed yet. Please run Option 1 first.")
                 print("Press Enter to continue...")
                 input()
                 continue
