@@ -9,7 +9,7 @@
 [![PHP](https://img.shields.io/badge/PHP-8.3%2F8.4%2F8.5-777BB4?logo=php&logoColor=white)](https://www.php.net/)
 [![MariaDB](https://img.shields.io/badge/MariaDB-10.11%20%7C%2011.8-003545?logo=mariadb&logoColor=white)](https://mariadb.org/)
 [![Redis](https://img.shields.io/badge/Redis-7.0%20%7C%208.0-DC382D?logo=redis&logoColor=white)](https://redis.io/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![License MIT](https://img.shields.io/badge/License-MIT-green?logo=opensourceinitiative&logoColor=white)
 
 ## What is InitOps?
 
