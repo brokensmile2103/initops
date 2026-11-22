@@ -9,11 +9,13 @@ import json
 import urllib.request
 import urllib.error
 import ast
+import glob
+import tempfile
 import time
 import shutil
 import hashlib
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 LOCK_FILE            = "/etc/.initops_deployed.lock"
 WEBSITES_CONFIG_FILE = "/etc/.initops_websites.conf"
 PULSE_CONFIG_FILE    = "/etc/.initops_pulse.conf"
@@ -36,9 +38,10 @@ if os.geteuid() != 0:
 # OS SUPPORT MATRIX (v2.0.0) — Ubuntu 24.04 LTS (noble) + Ubuntu 26.04 LTS (resolute)
 # =============================================================================
 # php_source:
-#   "ppa"     PHP comes from ppa:ondrej/php. Required on 24.04, whose own repositories
-#             only carry PHP 8.3 — 8.4 / 8.5 need the PPA.
-#   "archive" PHP comes straight from Ubuntu's OWN repositories — no third-party PPA at
+#   "sury"    PHP comes from packages.sury.org/php (Ondřej Surý's repository; it replaces
+#             the frozen ppa:ondrej/php). Required on 24.04, whose own repositories
+#             only carry PHP 8.3 — 8.4 / 8.5 need it.
+#   "archive" PHP comes straight from Ubuntu's OWN repositories — no third-party repo at
 #             all. Ubuntu 26.04 ships PHP 8.5 natively (php8.5-fpm, -mysql, -redis,
 #             -imagick ... are all in the `resolute` archive), so PHP 8.5 is the only
 #             version offered there.
@@ -48,7 +51,7 @@ if os.geteuid() != 0:
 SUPPORTED_UBUNTU = {
     "24.04": {
         "codename": "noble",
-        "php_source": "ppa",
+        "php_source": "sury",
         "php_versions": ("8.3", "8.4", "8.5"),
         "default_php": "8.4",
         "f2b_banaction": "iptables-multiport",
@@ -64,7 +67,7 @@ SUPPORTED_UBUNTU = {
 
 # Every PHP branch InitOps can DETECT on a running server (lock file / sockets / pool
 # dirs). Which of them may be freshly INSTALLED depends on the OS (see above): a server
-# upgraded from 24.04 to 26.04 may still be running PHP 8.4 from the PPA and must keep
+# upgraded from 24.04 to 26.04 may still be running PHP 8.4 from the Sury repo and must keep
 # working, even though 26.04 itself only offers PHP 8.5 for new installs.
 KNOWN_PHP_VERS = ("8.3", "8.4", "8.5")
 
@@ -72,6 +75,15 @@ KNOWN_PHP_VERS = ("8.3", "8.4", "8.5")
 # provisioned VPS, unattended-upgrades / cloud-init often hold the lock for the first
 # minutes, which made a bare `apt-get` die instantly with "Could not get lock".
 APT_GET = "apt-get -o DPkg::Lock::Timeout=300"
+
+# PHP packages for Ubuntu 24.04 come from Ondřej Surý's own repository. The Launchpad
+# PPA (ppa:ondrej/php) is frozen / being retired ("Use https://packages.sury.org/php/
+# instead") — the same repository that has always served Debian is used for Ubuntu now.
+SURY_REPO_URL     = "https://packages.sury.org/php/"
+SURY_KEYRING_DEB  = "https://packages.sury.org/debsuryorg-archive-keyring.deb"
+SURY_APT_GPG_URL  = "https://packages.sury.org/php/apt.gpg"
+SURY_KEYRING_PATH = "/usr/share/keyrings/debsuryorg-archive-keyring.gpg"
+SURY_SOURCES_FILE = "/etc/apt/sources.list.d/php.sources"
 
 
 def _read_os_release():
@@ -116,9 +128,9 @@ def supported_php_versions():
     return current_os()["php_versions"]
 
 
-def php_uses_ppa():
-    """True when PHP has to come from ppa:ondrej/php, False when Ubuntu's own repos carry it."""
-    return current_os()["php_source"] == "ppa"
+def php_uses_sury():
+    """True when PHP has to come from packages.sury.org/php, False when Ubuntu's own repos carry it."""
+    return current_os()["php_source"] == "sury"
 
 
 def check_os():
@@ -225,25 +237,92 @@ def _apt_has_candidate(pkg):
         and "Candidate: (none)" not in check.stdout
     )
 
+def _remove_legacy_ondrej_ppa():
+    """Drops the frozen ppa:ondrej/php source (and its key) plus any hand-made
+    packages.sury.org entry from an older setup, so apt never sees the same repository
+    twice and stops complaining that the PPA changed its Label. Safe to call on a
+    machine that never had the PPA."""
+    for pattern in ("/etc/apt/sources.list.d/ondrej-ubuntu-php*",
+                    "/etc/apt/trusted.gpg.d/ondrej-ubuntu-php*"):
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    for path in ("/etc/apt/sources.list.d/php.list", "/etc/apt/sources.list.d/php-sury.list"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                if "packages.sury.org" not in f.read():
+                    continue
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def setup_sury_repo(codename):
+    """Configures packages.sury.org/php for `codename` (the replacement for
+    ppa:ondrej/php): migrates away from the old PPA, installs the signing keyring and
+    writes a deb822 source. Idempotent — safe on a fresh box, on a re-run, and on a
+    server that is still on the PPA. Returns True on success. Does NOT run apt update."""
+    tmp_dir = tempfile.mkdtemp(prefix="sury-")
+    try:
+        deb_path = os.path.join(tmp_dir, "debsuryorg-archive-keyring.deb")
+        keyring_ok = (
+            run_cmd(f"curl -fsSLo {deb_path} {SURY_KEYRING_DEB}", ignore_error=True)
+            and run_cmd(f"dpkg -i {deb_path}", ignore_error=True)
+            and os.path.exists(SURY_KEYRING_PATH)
+        )
+        if not keyring_ok:
+            # Fallback: fetch the raw repository key into the very same path.
+            keyring_ok = (
+                run_cmd(f"curl -fsSLo {SURY_KEYRING_PATH} {SURY_APT_GPG_URL}", ignore_error=True)
+                and os.path.exists(SURY_KEYRING_PATH)
+            )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not keyring_ok:
+        print(f"\033[1;31m[ERROR]\033[0m Could not install the packages.sury.org signing key.")
+        print(f"       Check that this server can reach {SURY_REPO_URL}")
+        return False
+
+    # Key is in place — only now retire the frozen PPA (never leave the box with no PHP source).
+    _remove_legacy_ondrej_ppa()
+
+    try:
+        with open(SURY_SOURCES_FILE, "w", encoding="utf-8") as f:
+            f.write(
+                "Types: deb\n"
+                f"URIs: {SURY_REPO_URL}\n"
+                f"Suites: {codename}\n"
+                "Components: main\n"
+                f"Signed-By: {SURY_KEYRING_PATH}\n"
+            )
+    except OSError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Could not write {SURY_SOURCES_FILE}: {e}")
+        return False
+    return True
+
+
 def _php_package_list(v):
     """Builds the full apt package string for one PHP branch.
 
     Two package sources (see SUPPORTED_UBUNTU):
 
-    * ppa (Ubuntu 24.04, ondrej/php, PHP 8.3 / 8.4 / 8.5) — the same package set as
-      InitOps 1.9.x (plus an explicit php-cli). Optional extensions vary by branch on
-      the PPA (e.g. php8.5-opcache no longer exists as a separate .deb because OPcache
+    * sury (Ubuntu 24.04, packages.sury.org/php, PHP 8.3 / 8.4 / 8.5) — the same package
+      set as InitOps 1.9.x (plus an explicit php-cli). Optional extensions vary by branch
+      in that repository (e.g. php8.5-opcache no longer exists as a separate .deb because OPcache
       is compiled into PHP core starting with 8.5 — same idea can hit xmlrpc), so each
       optional one is availability-checked individually and a missing package never
       aborts the whole apt transaction.
 
     * archive (Ubuntu 26.04, Ubuntu's own repositories, PHP 8.5 only) — every name below
-      was checked against the `resolute` package index. Differences vs. the PPA list:
+      was checked against the `resolute` package index. Differences vs. the Sury list:
       no php8.5-exif (a virtual package provided by php8.5-common, so exif is always
       there) and no php8.5-opcache (built into PHP 8.5 core).
 
     Core PHP packages must exist for every supported branch — if one is missing,
-    something is genuinely wrong (bad PPA / missing `universe` / wrong arch).
+    something is genuinely wrong (bad repo / missing `universe` / wrong arch).
 
     Shared by the initial deploy (install_packages) and the post-deploy
     PHP Version Manager.
@@ -257,7 +336,7 @@ def _php_package_list(v):
         f"php{v}-zip php{v}-soap"
     )
 
-    if php_uses_ppa():
+    if php_uses_sury():
         php_core += f" php{v}-exif"
         optional_extensions = [f"php{v}-opcache", f"php{v}-xmlrpc"]
     else:
@@ -308,12 +387,19 @@ def install_packages(php_ver=None):
     run_cmd("echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections")
     run_cmd("echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections")
 
-    if php_uses_ppa():
-        run_cmd("add-apt-repository -y ppa:ondrej/php")
+    if php_uses_sury():
+        print(f" -> {os_info['pretty']}: PHP {php_ver} comes from packages.sury.org/php.")
+        if not setup_sury_repo(os_info["codename"]):
+            sys.exit(1)
         run_cmd(f"{APT_GET} update")
+        if not _apt_has_candidate(f"php{php_ver}-fpm"):
+            print(f"\033[1;31m[ERROR]\033[0m php{php_ver}-fpm has no installable candidate after adding "
+                  f"packages.sury.org/php.")
+            print(f"       Run '{APT_GET} update' and 'apt-cache policy php{php_ver}-fpm' to see why.")
+            sys.exit(1)
     else:
         print(f" -> {os_info['pretty']}: PHP {php_ver} comes from Ubuntu's own repositories "
-              f"(no third-party PPA needed).")
+              f"(no third-party repository needed).")
         if not _apt_has_candidate(f"php{php_ver}-fpm"):
             print(f"\033[1;31m[ERROR]\033[0m php{php_ver}-fpm has no installable candidate in the "
                   f"Ubuntu repositories.")
@@ -334,8 +420,8 @@ def install_packages(php_ver=None):
 
     if not run_cmd(f"{APT_GET} install -y {packages}", ignore_error=True):
         print(f"\033[1;31m[ERROR]\033[0m Failed to install PHP {v} packages.")
-        if php_uses_ppa():
-            print(f"       The ondrej/php PPA may not have fully built all PHP {v} extensions yet")
+        if php_uses_sury():
+            print(f"       packages.sury.org/php may not have fully built all PHP {v} extensions yet")
             print(f"       for this Ubuntu release/architecture. Try 'apt-cache policy php{v}-fpm'")
             print(f"       to check package availability, or pick a different PHP version.")
         else:
@@ -2225,7 +2311,7 @@ def _detect_php_ver():
     Priority: lock file (source of truth) → running socket → installed pool dir → OS default.
 
     Detection deliberately uses KNOWN_PHP_VERS rather than the per-OS install list: a
-    server upgraded from Ubuntu 24.04 to 26.04 may still be running PHP 8.4 from the PPA
+    server upgraded from Ubuntu 24.04 to 26.04 may still be running PHP 8.4 from the Sury repo
     and must be recognised as such, even though 26.04 itself only offers PHP 8.5.
     """
     # 1. Read from lock file (most reliable — written at deploy time)
@@ -2846,7 +2932,7 @@ def _installed_php_versions():
 def choose_php_version():
     """Interactive PHP branch picker for the initial deploy. Only offers what the running
     OS can actually install (see SUPPORTED_UBUNTU): 24.04 → 8.3 / 8.4 / 8.5 from the
-    ondrej PPA; 26.04 → only PHP 8.5, straight from Ubuntu's own repositories."""
+    packages.sury.org/php; 26.04 → only PHP 8.5, straight from Ubuntu's own repositories."""
     os_info = current_os()
     versions = list(os_info["php_versions"])
     default = os_info["default_php"]
@@ -2854,7 +2940,7 @@ def choose_php_version():
     if len(versions) == 1:
         only = versions[0]
         print(f" PHP Version: \033[1;33m{only}\033[0m — {os_info['pretty']} ships PHP {only} in its own "
-              f"repositories (no PPA needed).")
+              f"repositories (no third-party repository needed).")
         print("              It is the only PHP version supported on this Ubuntu release.")
         print(f"\033[1;32m -> PHP {only} selected.\033[0m\n")
         return only
@@ -2907,9 +2993,11 @@ def _install_php_extra(v):
     os.environ["DEBIAN_FRONTEND"] = "noninteractive"
     os.environ["NEEDRESTART_MODE"] = "a"
 
-    if php_uses_ppa():
-        print(f"\n\033[1;32m[*] Installing PHP {v} from ondrej/php PPA...\033[0m")
-        run_cmd("add-apt-repository -y ppa:ondrej/php", ignore_error=True)
+    if php_uses_sury():
+        print(f"\n\033[1;32m[*] Installing PHP {v} from packages.sury.org/php...\033[0m")
+        # Also migrates a server that is still on the frozen ppa:ondrej/php source.
+        if not setup_sury_repo(os_info["codename"]):
+            return False
     else:
         print(f"\n\033[1;32m[*] Installing PHP {v} from Ubuntu's repositories...\033[0m")
     run_cmd(f"{APT_GET} update")
@@ -3066,7 +3154,7 @@ def php_version_manager():
         print("=" * 60 + "\033[0m")
         os_info = current_os()
         supported = os_info["php_versions"]
-        src_txt = "ondrej/php PPA" if php_uses_ppa() else "Ubuntu repositories (no PPA)"
+        src_txt = "packages.sury.org/php" if php_uses_sury() else "Ubuntu repositories (no third-party repo)"
         print(f" {os_info['pretty']}  |  PHP source: {src_txt}")
         print("-" * 60)
         shown = [v for v in KNOWN_PHP_VERS if v in supported or v in installed]

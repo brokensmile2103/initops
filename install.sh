@@ -1,6 +1,6 @@
 #!/bin/bash
 # -------------------------------------------------------------------------
-# InitOps v2.0.0 - Automated LEMP & WordPress Deployment Engine
+# InitOps v2.0.1 - Automated LEMP & WordPress Deployment Engine
 # Supported: Ubuntu 24.04 LTS and Ubuntu 26.04 LTS
 # -------------------------------------------------------------------------
 
@@ -17,7 +17,7 @@ OS_PRETTY="$( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" )"
 
 if [ "$OS_ID" != "ubuntu" ] || { [ "$OS_VERSION_ID" != "24.04" ] && [ "$OS_VERSION_ID" != "26.04" ]; }; then
   echo -e "\e[1;31m[ERROR]\e[0m Unsupported operating system: ${OS_PRETTY:-unknown}"
-  echo "       InitOps 2.0.0 supports Ubuntu 24.04 LTS and Ubuntu 26.04 LTS. Aborting."
+  echo "       InitOps 2.0.1 supports Ubuntu 24.04 LTS and Ubuntu 26.04 LTS. Aborting."
   exit 1
 fi
 
