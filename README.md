@@ -1,4 +1,4 @@
-# InitOps v2.0.0
+# InitOps v2.0.1
 
 > **One-command LEMP stack + WordPress deployment engine for Ubuntu 24.04 LTS and Ubuntu 26.04 LTS.**
 >
@@ -251,7 +251,7 @@ After deployment, the system **auto-detects** your running PHP version when you 
 
 ```
 ============================================================
-                    InitOps v2.0.0
+                    InitOps v2.0.1
 ============================================================
  [System]:              4 CPU Cores | 4096 MB RAM
  [OS]:                  Ubuntu 26.04 LTS
