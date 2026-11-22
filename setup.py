@@ -304,6 +304,55 @@ def setup_sury_repo(codename):
     return True
 
 
+def _legacy_ondrej_ppa_present():
+    """True when this machine still has an apt source for the frozen ppa:ondrej/php."""
+    if glob.glob("/etc/apt/sources.list.d/ondrej-ubuntu-php*"):
+        return True
+    for path in glob.glob("/etc/apt/sources.list.d/*.list") + ["/etc/apt/sources.list"]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s.startswith("#") and "ppa.launchpad" in s and "/ondrej/php/" in s:
+                        return True
+        except OSError:
+            pass
+    return False
+
+
+def migrate_php_repo(force=False):
+    """Moves an already-deployed Ubuntu 24.04 server from the frozen ppa:ondrej/php to
+    packages.sury.org/php. Runs on every launch (including `initops update`) and does
+    nothing unless the old PPA is still configured on a deployed server, so it is cheap
+    and safe to call repeatedly. `force` skips the 'deployed' check (manual command).
+    Never raises and never aborts the caller. Returns True when a migration ran."""
+    try:
+        os_info = get_os_info()
+        if not os_info or os_info["php_source"] != "sury":
+            return False
+        if not force and not os.path.exists(LOCK_FILE):
+            return False   # fresh box: install_packages() sets the repo up itself
+        if not _legacy_ondrej_ppa_present():
+            return False
+
+        print("\033[1;33m[*] This server still uses the frozen ppa:ondrej/php source. "
+              "Migrating to packages.sury.org/php...\033[0m")
+        if not setup_sury_repo(os_info["codename"]):
+            print("\033[1;33m[WARN]\033[0m PHP repository migration failed — nothing was "
+                  "changed in your PHP install. Retry with: initops migrate-php-repo\033[0m")
+            return False
+        os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+        if not run_cmd(f"{APT_GET} update", ignore_error=True):
+            print("\033[1;33m[WARN]\033[0m 'apt-get update' reported errors after the migration. "
+                  "Run it manually to see which source is failing.\033[0m")
+            return True
+        print("\033[1;32m -> PHP packages now come from packages.sury.org/php.\033[0m")
+        return True
+    except Exception as e:
+        print(f"\033[1;33m[WARN]\033[0m PHP repository migration skipped: {e}")
+        return False
+
+
 def _php_package_list(v):
     """Builds the full apt package string for one PHP branch.
 
@@ -3327,7 +3376,8 @@ def cmd_update():
     else:
         print(f"\033[1;32m -> Updated InitOps: v{VERSION} -> v{new_version}\033[0m")
     print(f"    Previous version backed up to {INITOPS_BIN_PATH}.bak")
-    print("    Run 'initops' again to use the new version.")
+    print("    Run 'initops' again to use the new version"
+          " (it also moves an old ppa:ondrej/php source to packages.sury.org/php).")
 
 
 def main():
@@ -3554,6 +3604,15 @@ def main():
             input()
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate-php-repo":
+        # Manual trigger (also what the auto-migration below prints as the retry hint).
+        if not migrate_php_repo(force=True):
+            print("Nothing to migrate (no ppa:ondrej/php source found, or not Ubuntu 24.04).")
+        sys.exit(0)
+    # Existing 24.04 deployments: move off the frozen PPA on the first launch of this
+    # version — covers both the menu and `initops update`.
+    if migrate_php_repo():
+        time.sleep(2)
     if len(sys.argv) > 1 and sys.argv[1] == "update":
         cmd_update()
         sys.exit(0)
